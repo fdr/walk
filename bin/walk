@@ -1,0 +1,644 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/walk — CLI entrypoint for walk explorations.
+#
+# Human-facing:
+#   walk new <name> [--title '...']
+#   walk run <name> [--once] [--dry-run] [--preview <slug>]
+#   walk status <name>
+#
+# Agent-facing (use WALK_DIR/WALK_ISSUE env vars, or --walk-dir/--slug flags):
+#   walk show <slug> [--walk-dir PATH]
+#   walk close [--status STATUS] --reason 'reason' [--walk-dir PATH] [--slug SLUG]
+#   walk comment 'text' [--walk-dir PATH] [--slug SLUG]
+#   walk create <slug> --title '...' [--type TYPE] [--priority N] [--blocked-by SLUG] --body '...' [--walk-dir PATH]
+#   walk list [--status open|closed] [--walk-dir PATH]
+#   walk runs <slug> [--walk-dir PATH]
+#
+# All subcommands support --json for structured output.
+
+$stdout.sync = true
+$stderr.sync = true
+
+require "yaml"
+require "json"
+require "fileutils"
+require "time"
+require "optparse"
+
+require_relative "../lib/walk/directory_backend"
+require_relative "../lib/walk/prompt_builder"
+require_relative "../lib/walk/reporting"
+require_relative "../lib/walk/driver"
+
+# ---------------------------------------------------------------------------
+# CLI subcommands
+# ---------------------------------------------------------------------------
+
+def resolve_walk_dir(name_or_env)
+  # If WALK_DIR env is set, use it
+  if name_or_env.nil? && ENV["WALK_DIR"]
+    return ENV["WALK_DIR"]
+  end
+
+  return nil if name_or_env.nil?
+
+  # If it's an absolute or relative path that exists, use it
+  expanded = File.expand_path(name_or_env)
+  return expanded if Dir.exist?(expanded)
+
+  # Try as a subdirectory name
+  nil
+end
+
+def resolve_slug(args, env_key: "WALK_ISSUE")
+  slug = args.shift
+  slug ||= ENV[env_key]
+  slug
+end
+
+def output(data, json: false)
+  if json
+    puts JSON.pretty_generate(data)
+  else
+    yield data if block_given?
+  end
+end
+
+# --- Subcommand: new ---
+
+def cmd_new(args)
+  title = nil
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk new <name> [--title '...']"
+    opts.on("--title TITLE", "Walk title") { |t| title = t }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  unless name
+    $stderr.puts parser.help
+    exit 1
+  end
+
+  title ||= name
+  path = File.expand_path(name)
+
+  backend = Walk::DirectoryBackend.new(path)
+  result = backend.scaffold_walk(title: title)
+  unless result
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Created walk: #{r[:title]}"
+    puts "  Directory: #{r[:walk_dir]}"
+    puts "  Add issues in: #{r[:walk_dir]}/open/"
+  end
+end
+
+# --- Subcommand: run ---
+
+def cmd_run(args)
+  once = false
+  dry_run = false
+  preview = nil
+  preview_planning = false
+  claude_md = nil
+  command = nil
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk run <name> [--once] [--dry-run] [--preview <slug>] [--preview-planning]"
+    opts.on("--once", "Run one issue then exit") { once = true }
+    opts.on("--dry-run", "Print prompts without spawning agents") { dry_run = true }
+    opts.on("--preview SLUG", "Preview prompt for a specific issue") { |s| preview = s }
+    opts.on("--preview-planning", "Preview the planning prompt") { preview_planning = true }
+    opts.on("--claude-md PATH", "Path to CLAUDE.md (default: WALK_DIR/CLAUDE.md if present)") { |p| claude_md = p }
+    opts.on("--command CMD", "Agent command (default: claude)") { |c| command = c }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    $stderr.puts parser.help
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+
+  # Read walk-level config from _walk.md frontmatter (if present)
+  walk_meta = backend.read_walk_meta
+  walk_config = walk_meta ? walk_meta[:config] : {}
+
+  # Re-entrancy check: warn if walk was previously completed/stalled/stopped
+  if walk_meta && %w[completed stalled stopped].include?(walk_meta[:status])
+    $stderr.puts "Warning: walk '#{walk_meta[:title]}' has status '#{walk_meta[:status]}'"
+    if walk_meta[:frontmatter]["finish_reason"]
+      $stderr.puts "  Reason: #{walk_meta[:frontmatter]["finish_reason"]}"
+    end
+    $stderr.puts "  Resetting status to 'open' to continue."
+    backend.update_walk_status("open")
+  end
+
+  # Merge: CLI flags > walk config > hardcoded defaults
+  effective_claude_md = claude_md ||
+    walk_config[:claude_md_path] ||
+    (File.exist?(File.join(walk_dir, "CLAUDE.md")) ? File.join(walk_dir, "CLAUDE.md") : nil)
+  effective_close_protocol = walk_config.fetch(:close_protocol, :result_md)
+  effective_spawn_mode = walk_config.fetch(:spawn_mode, :capture)
+  effective_max_turns = walk_config.fetch(:max_turns, 10)
+  effective_sleep_interval = walk_config.fetch(:sleep_interval, 5)
+  effective_model = walk_config[:model]
+  effective_preamble = walk_config[:preamble]
+  effective_max_concurrent = walk_config.fetch(:max_concurrent, 1)
+
+  prompt_builder = Walk::PromptBuilder.new(
+    project_dir: walk_dir,
+    claude_md_path: effective_claude_md,
+    preamble: effective_preamble,
+    close_protocol: effective_close_protocol
+  )
+
+  driver = Walk::Driver.new(
+    backend: backend,
+    prompt_builder: prompt_builder,
+    spawn_mode: effective_spawn_mode,
+    max_turns: effective_max_turns,
+    sleep_interval: effective_sleep_interval,
+    model: effective_model,
+    max_concurrent: effective_max_concurrent,
+    command: command
+  )
+
+  if preview
+    driver.preview(preview)
+  elsif preview_planning
+    driver.preview_planning
+  else
+    driver.run(once: once, dry_run: dry_run)
+  end
+end
+
+# --- Subcommand: status ---
+
+def cmd_status(args)
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk status <name>"
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  status = backend.walk_status
+
+  output(status, json: json_output) do |s|
+    Walk::Reporting.print_status(s)
+  end
+end
+
+# --- Subcommand: show ---
+
+def cmd_show(args)
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk show <slug> [--walk-dir PATH]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  slug = resolve_slug(args)
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+  unless slug && walk_dir
+    $stderr.puts "Error: slug required (pass as argument or set WALK_ISSUE env)"
+    $stderr.puts "Error: WALK_DIR env or --walk-dir must be set" unless walk_dir
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  issue = backend.show_issue(slug)
+  unless issue
+    $stderr.puts "Error: issue '#{slug}' not found"
+    exit 1
+  end
+
+  output(issue, json: json_output) do |i|
+    puts "#{i[:slug]} — #{i[:title]}"
+    puts "Type: #{i[:type]} | Priority: #{i[:priority]} | Status: #{i[:status]}"
+    puts ""
+    puts i[:body] if i[:body] && !i[:body].empty?
+    if i[:close_reason]
+      puts ""
+      puts "Close reason: #{i[:close_reason]}"
+    end
+    if i[:result]
+      puts ""
+      puts "Result:"
+      puts i[:result]
+    end
+  end
+end
+
+# --- Subcommand: close ---
+
+def cmd_close(args)
+  reason = nil
+  close_status = "closed"
+  json_output = false
+  walk_dir_flag = nil
+  slug_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk close [--status STATUS] --reason 'reason' [--walk-dir PATH] [--slug SLUG]"
+    opts.on("--reason REASON", "Close reason (required)") { |r| reason = r }
+    opts.on("--status STATUS", "Status: closed, blocked, deferred (default: closed)") { |s| close_status = s }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--slug SLUG", "Issue slug (overrides WALK_ISSUE env)") { |s| slug_flag = s }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  # Allow reason as positional arg if --reason not given
+  reason ||= args.shift
+
+  slug = slug_flag || ENV["WALK_ISSUE"]
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless reason
+    $stderr.puts "Error: --reason is required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless slug
+    $stderr.puts "Error: WALK_ISSUE env var or --slug must be set"
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.close_issue(slug, reason: reason, status: close_status)
+  unless result
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Closed #{r[:slug]} (#{r[:status]}): #{r[:reason]}"
+  end
+end
+
+# --- Subcommand: comment ---
+
+def cmd_comment(args)
+  json_output = false
+  walk_dir_flag = nil
+  slug_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk comment 'text' [--walk-dir PATH] [--slug SLUG]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--slug SLUG", "Issue slug (overrides WALK_ISSUE env)") { |s| slug_flag = s }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  text = args.join(" ")
+  slug = slug_flag || ENV["WALK_ISSUE"]
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  if text.empty?
+    $stderr.puts "Error: comment text required"
+    exit 1
+  end
+  unless slug
+    $stderr.puts "Error: WALK_ISSUE env var or --slug must be set"
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.add_comment(slug, text)
+  unless result
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Comment added to #{r[:slug]}"
+  end
+end
+
+# --- Subcommand: create ---
+
+def cmd_create(args)
+  title = nil
+  type = "task"
+  priority = 2
+  body = ""
+  blocked_by = []
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk create <slug> --title '...' [--type TYPE] [--priority N] [--blocked-by SLUG] --body '...' [--walk-dir PATH]"
+    opts.on("--title TITLE", "Issue title (required)") { |t| title = t }
+    opts.on("--type TYPE", "Issue type (default: task)") { |t| type = t }
+    opts.on("--priority N", Integer, "Priority 1-3 (default: 2)") { |p| priority = p }
+    opts.on("--blocked-by SLUG", "Blocking issue slug (repeatable)") { |s| blocked_by << s }
+    opts.on("--body TEXT", "Issue body/description") { |b| body = b }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  slug = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless slug
+    $stderr.puts "Error: slug required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless title
+    $stderr.puts "Error: --title required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.create_issue_by_slug(slug,
+    title: title, type: type, priority: priority,
+    body: body, blocked_by: blocked_by.empty? ? nil : blocked_by)
+  unless result
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Created issue: #{r[:slug]} — #{r[:title]}"
+    puts "  Type: #{r[:type]} | Priority: #{r[:priority]}"
+    puts "  Dir: #{r[:dir]}"
+  end
+end
+
+# --- Subcommand: runs ---
+
+def cmd_runs(args)
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk runs <slug> [--walk-dir PATH]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  slug = resolve_slug(args)
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless slug
+    $stderr.puts "Error: slug required (pass as argument or set WALK_ISSUE env)"
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  issue = backend.show_issue(slug)
+  unless issue
+    $stderr.puts "Error: issue '#{slug}' not found"
+    exit 1
+  end
+
+  runs_dir = File.join(issue[:dir], "runs")
+  unless Dir.exist?(runs_dir)
+    output([], json: json_output) { puts "No runs for #{slug}." }
+    return
+  end
+
+  runs = Dir.children(runs_dir).sort.filter_map { |ts_dir|
+    full = File.join(runs_dir, ts_dir)
+    next unless Dir.exist?(full)
+
+    meta_file = File.join(full, "meta.json")
+    meta = File.exist?(meta_file) ? JSON.parse(File.read(meta_file), symbolize_names: true) : {}
+    {
+      timestamp: ts_dir,
+      dir: full,
+      exit_code: meta[:exit_code],
+      started_at: meta[:started_at],
+      finished_at: meta[:finished_at],
+      cost_usd: meta[:cost_usd],
+      has_prompt: File.exist?(File.join(full, "prompt.txt")),
+      has_output: File.exist?(File.join(full, "output.txt")),
+      has_stderr: File.exist?(File.join(full, "stderr.txt"))
+    }
+  }
+
+  output(runs, json: json_output) do |list|
+    if list.empty?
+      puts "No runs for #{slug}."
+    else
+      puts "Runs for #{slug} (#{list.length}):"
+      list.each do |r|
+        status = r[:exit_code] ? "exit=#{r[:exit_code]}" : "no meta"
+        cost = r[:cost_usd] ? " $#{"%.2f" % r[:cost_usd]}" : ""
+        files = []
+        files << "prompt" if r[:has_prompt]
+        files << "output" if r[:has_output]
+        files << "stderr" if r[:has_stderr]
+        puts "  #{r[:timestamp]}  #{status}#{cost}  [#{files.join(", ")}]"
+      end
+    end
+  end
+end
+
+# --- Subcommand: history ---
+
+def cmd_history(args)
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk history <name>"
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  data = Walk::Reporting.walk_data(backend)
+
+  json_data = {
+    title: data[:title],
+    body: data[:body],
+    started_at: data[:started_at]&.iso8601,
+    issues_closed: data[:issues_closed],
+    timeline: data[:timeline],
+    total_runs: data[:total_runs],
+    total_duration_s: data[:total_duration_s],
+    total_cost: data[:total_cost]
+  }
+
+  output(json_data, json: json_output) do |_|
+    Walk::Reporting.print_history(data)
+  end
+end
+
+# --- Subcommand: summary ---
+
+def cmd_summary(args)
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk summary <name>"
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  data = Walk::Reporting.walk_data(backend)
+
+  json_data = {
+    title: data[:title],
+    body: data[:body],
+    started_at: data[:started_at]&.iso8601,
+    issues_closed: data[:issues_closed],
+    open_issues_count: data[:open_issues_count],
+    timeline: data[:timeline],
+    open_issues: data[:open_issues].map { |i| { slug: i[:slug], title: i[:title], type: i[:type], priority: i[:priority] } },
+    total_runs: data[:total_runs],
+    total_duration_s: data[:total_duration_s],
+    total_cost: data[:total_cost]
+  }
+
+  output(json_data, json: json_output) do |_|
+    puts Walk::Reporting.render_summary_markdown(data)
+  end
+end
+
+# --- Subcommand: list ---
+
+def cmd_list(args)
+  list_status = "open"
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk list [--status open|closed] [--walk-dir PATH]"
+    opts.on("--status STATUS", "Filter by status: open or closed (default: open)") { |s| list_status = s }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  walk_dir = walk_dir_flag || resolve_walk_dir(args.shift)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: WALK_DIR env var, --walk-dir, or walk name must be provided"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  issues = backend.list_issues(status: list_status)
+
+  output(issues, json: json_output) do |list|
+    if list.empty?
+      puts "No #{list_status} issues."
+    else
+      list.each do |i|
+        prefix = list_status == "closed" ? "x" : " "
+        puts "[#{prefix}] #{i[:slug]} — #{i[:title]} (P#{i[:priority]}, #{i[:type]})"
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+SUBCOMMANDS = {
+  "new"     => method(:cmd_new),
+  "run"     => method(:cmd_run),
+  "status"  => method(:cmd_status),
+  "history" => method(:cmd_history),
+  "summary" => method(:cmd_summary),
+  "show"    => method(:cmd_show),
+  "close"   => method(:cmd_close),
+  "comment" => method(:cmd_comment),
+  "create"  => method(:cmd_create),
+  "list"    => method(:cmd_list),
+  "runs"    => method(:cmd_runs)
+}.freeze
+
+def main
+  if ARGV.empty? || ARGV.first == "--help" || ARGV.first == "-h"
+    puts <<~HELP
+      walk — CLI for walk explorations
+
+      Human-facing:
+        walk new <name> [--title '...']                Create a new walk
+        walk run <name> [--once] [--dry-run]           Run the driver loop
+              [--preview <slug>]                       Preview issue prompt
+              [--preview-planning]                     Preview planning prompt
+              [--claude-md PATH]                       Path to CLAUDE.md
+              [--command CMD]                          Agent command (default: claude)
+        walk status <name>                             Show walk dashboard
+        walk history <name>                            Chronological timeline
+        walk summary <name>                            Markdown summary report
+
+      Agent-facing (WALK_DIR/WALK_ISSUE env vars, or --walk-dir/--slug flags):
+        walk show <slug>                      Show issue details
+        walk close --reason 'reason'          Close current issue
+        walk comment 'text'                   Add comment to current issue
+        walk create <slug> --title '...'      Create new issue
+        walk list [--status open|closed]      List issues
+        walk runs <slug>                      List runs for an issue
+
+      All subcommands support --json for structured output.
+    HELP
+    exit 0
+  end
+
+  subcmd = ARGV.shift
+  handler = SUBCOMMANDS[subcmd]
+  unless handler
+    $stderr.puts "Unknown subcommand: #{subcmd}"
+    $stderr.puts "Run 'walk --help' for usage."
+    exit 1
+  end
+
+  handler.call(ARGV)
+end
+
+main
