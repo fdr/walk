@@ -95,6 +95,8 @@ module Walk
       output_file = @logs_dir ? File.join(@logs_dir, "#{timestamp}-planning-output.jsonl") : nil
 
       File.write(prompt_file, prompt) if prompt_file
+      log(:info, "  Prompt: #{prompt_file}") if prompt_file
+      log(:info, "  Output: #{output_file}") if output_file
 
       log(:info, "Planning agent started at #{Time.now}...")
 

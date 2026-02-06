@@ -678,6 +678,121 @@ def cmd_resume(args)
   end
 end
 
+# --- Subcommand: follow ---
+
+def cmd_follow(args)
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk follow <name> [log-file]"
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  logs_dir = File.join(walk_dir, "logs")
+  unless Dir.exist?(logs_dir)
+    $stderr.puts "Error: logs directory not found: #{logs_dir}"
+    exit 1
+  end
+
+  # Find latest output.jsonl or use specified file
+  log_file = args.shift
+  unless log_file
+    candidates = Dir.glob(File.join(logs_dir, "*-output.jsonl")).sort_by { |f| File.mtime(f) }
+    if candidates.empty?
+      $stderr.puts "No output logs found in #{logs_dir}"
+      exit 1
+    end
+    log_file = candidates.last
+  end
+  log_file = File.join(logs_dir, log_file) unless log_file.start_with?("/")
+
+  puts "Following: #{log_file}"
+  puts "=" * 60
+
+  # Track file position for tail -f behavior
+  last_size = 0
+
+  loop do
+    current_size = File.size(log_file) rescue 0
+
+    if current_size > last_size
+      File.open(log_file, "r") do |f|
+        f.seek(last_size)
+        f.each_line do |line|
+          print_jsonl_line(line.strip)
+        end
+      end
+      last_size = current_size
+    end
+
+    sleep 0.3
+  end
+rescue Interrupt
+  puts "\nStopped."
+end
+
+def print_jsonl_line(line)
+  return if line.empty?
+
+  begin
+    data = JSON.parse(line)
+  rescue JSON::ParserError
+    puts line
+    return
+  end
+
+  type = data["type"]
+  case type
+  when "assistant"
+    msg = data.dig("message", "content")
+    return unless msg.is_a?(Array)
+
+    msg.each do |block|
+      case block["type"]
+      when "text"
+        puts "\n\e[36m#{block["text"]}\e[0m"
+      when "thinking"
+        puts "\n\e[33m[thinking] #{block["thinking"]}\e[0m"
+      when "tool_use"
+        name = block["name"]
+        input = block["input"]
+        puts "\n\e[32m→ #{name}\e[0m"
+        if input.is_a?(Hash)
+          input.each do |k, v|
+            v_str = v.is_a?(String) ? v : v.to_json
+            v_str = v_str[0..200] + "..." if v_str.length > 200
+            puts "    #{k}: #{v_str}"
+          end
+        end
+      end
+    end
+
+  when "user"
+    # Tool results
+    msg = data.dig("message", "content")
+    return unless msg.is_a?(Array)
+
+    msg.each do |block|
+      next unless block["type"] == "tool_result"
+      content = block["content"]
+      content = content[0..500] + "..." if content.is_a?(String) && content.length > 500
+      puts "\e[90m← #{content}\e[0m"
+    end
+
+  when "system"
+    subtype = data["subtype"]
+    case subtype
+    when "init"
+      puts "\e[35m[session init] model=#{data["model"]}\e[0m"
+    end
+  end
+end
+
 # --- Subcommand: epochs ---
 
 def cmd_epochs(args)
@@ -784,6 +899,7 @@ SUBCOMMANDS = {
   "list"    => method(:cmd_list),
   "runs"    => method(:cmd_runs),
   "resume"  => method(:cmd_resume),
+  "follow"  => method(:cmd_follow),
   "epochs"  => method(:cmd_epochs)
 }.freeze
 
