@@ -164,12 +164,18 @@ module Walk
         driver_protocol: <<~S.chomp,
           DRIVER PROTOCOL:
           - Work ONLY on this issue. Do NOT expand scope.
-          - Document approach and findings as you go (write notes to #{dir}/comments.md).
+          - Document approach and findings as you go using: walk comment "your notes here"
           - Create sub-issues for follow-up work using: walk create <slug> --title "..." --body "..."
           - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
           - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
           - TO CLOSE: write result.md in #{dir} (first line = close reason), then EXIT immediately.
             The driver handles the rest.
+
+          VERIFY YOUR WALK OPERATIONS (use walk CLI, not just filesystem):
+          - After `walk create <slug>`: run `walk list` to confirm issue appears
+          - After `walk comment`: run `walk show` to verify comment was added
+          - If you write files directly (issue.md, result.md): run `walk show` to check state
+          - Prefer `walk comment "..."` over writing to comments.md directly
         S
         live_comment_watching: <<~S.chomp,
           LIVE FEEDBACK (for user steering during execution):
@@ -179,8 +185,9 @@ module Walk
             that you did NOT write — these are human feedback
           - Incorporate any user direction into your work
           - This lets the user communicate with you while you run
+          - After responding to feedback, use `walk show` to verify issue state
         S
-        git_branch_doc: "Document the branch name in #{dir}/comments.md so the next agent can find it"
+        git_branch_doc: "Document the branch name using: walk comment \"Branch: <branch-name>\""
       }
     end
 
