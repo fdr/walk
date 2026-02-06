@@ -80,6 +80,67 @@ Read goals: `head -30 ~/walk-enx/_walk.md`
 
 See what planner would do: `WALK_DIR=~/walk-enx ~/walk/bin/walk run --preview-planning`
 
+## Context architecture
+
+Executor and planner prompts are composed from multiple sources. Understanding
+the architecture helps you edit the right layer when things go wrong.
+
+```
+Executor prompt:
+┌─────────────────────────────────────────────┐
+│ 1. CLAUDE.md      - project tech context    │
+│ 2. _walk.md       - goals, topic, addenda   │
+│ 3. Issue body     - specific task           │
+│ 4. Driver epilogue - protocol, git hygiene  │
+└─────────────────────────────────────────────┘
+
+Planner prompt:
+┌─────────────────────────────────────────────┐
+│ 1. CLAUDE.md      - project tech context    │
+│ 2. _walk.md       - goals, topic, addenda   │
+│ 3. Closed issues  - findings to triage      │
+│ 4. Driver steps   - evaluate, create issues │
+└─────────────────────────────────────────────┘
+```
+
+**Which layer to edit for which problem:**
+
+| Problem | Edit |
+|---------|------|
+| Executor uses wrong approach repeatedly | `_walk.md` - add to constraints or method guidance |
+| Executor ignores specific tools | `_walk.md` - add "Use X, not Y" in Investigation Rigor |
+| Planner creates vague issues | Driver Step 4 (prompt_builder.rb) - tighten issue requirements |
+| Executor doesn't follow close protocol | Driver epilogue (prompt_builder.rb) |
+| Goal is misunderstood | `_walk.md` - clarify Goals and Completion Criteria |
+| Technical context missing | `CLAUDE.md` - add project-specific knowledge |
+
+**Context engineering addenda in _walk.md:**
+
+The `_walk.md` file can include context engineering notes beyond just goals.
+These propagate to all agents:
+
+```markdown
+## Investigation Rigor
+
+When behavior is unclear, profile it with `perf` and `bpftrace`.
+Understanding comes from measurement, not speculation.
+
+## Off-limits approaches
+
+- Worker-count detection (proxy signals, not root cause)
+- TSC-based heuristics (microarchitecturally sensitive)
+```
+
+**Evaluating if context is working:**
+
+1. Read closed issue results - did executor do what was asked?
+2. Check planner output - are issues well-specified with escape hatches closed?
+3. Look for patterns - same mistake repeated = missing context somewhere
+
+When executors repeatedly diverge from intent despite good issue descriptions,
+the gap is usually in `_walk.md` (missing constraint) or `CLAUDE.md` (missing
+technical context), not the issue itself.
+
 ## Related
 
 - `context-debug.md`: Trace analysis framework for diagnosing executor failures
