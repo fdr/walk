@@ -531,6 +531,24 @@ module Walk
         - <id> (<title>): TERMINAL — <one-line rationale>
         - <id> (<title>): GENERATIVE — <what new question/gap it opens> → N follow-ups
 
+        ### Evaluating investigation quality
+
+        Before classifying an investigation as TERMINAL, check: does it trace
+        a causal path, or just report correlations?
+
+        - Correlation: "X is high when Y is low"
+        - Causation: "X causes Y because [specific code path / hardware behavior]"
+
+        If the investigation measured things but didn't trace WHY, it's GENERATIVE.
+        Create a follow-up to find the causal mechanism.
+
+        ### Evaluating blocked/incomplete closures
+
+        If an issue closed with "blocked by X" or "partial results":
+        - This is GENERATIVE, not terminal
+        - Create a follow-up to unblock and complete the work
+        - Technical obstacles are usually solvable — check logs, try alternatives
+
         ## Step 4: Create follow-up issues from generative findings
 
         For each generative issue from your triage, create 0-2 follow-up issues.
@@ -615,6 +633,8 @@ module Walk
         - DO NOT create issues with vague goals ("improve performance", "investigate further")
         - DO NOT create issues that duplicate recently-closed work
         - DO NOT create more issues than there are generative findings to follow up
+        - DO NOT accept correlations as explanations — require traced causal paths
+        - DO NOT mark "blocked by technical issue" as terminal — unblock it
 
         ## Step 5: Verify and exit
 
