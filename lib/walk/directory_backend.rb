@@ -23,7 +23,9 @@ module Walk
     # --- Backend interface ---
 
     def ready_issues(parent: nil)
-      list_issues(status: "open")
+      # list_issues already filters out blocked issues via blocked?
+      # Just exclude epics (containers, not work items)
+      list_issues(status: "open").reject { |i| i[:type] == "epic" }
     end
 
     def fetch_issue(id)
@@ -70,6 +72,8 @@ module Walk
     end
 
     def load_parent_context(issue)
+      # Return walk-level context only.
+      # Agents can opt-in to reading parent issues via discovered_by/ symlinks.
       meta = read_walk_meta
       return nil unless meta
 
@@ -467,10 +471,14 @@ module Walk
           FileUtils.mkdir_p(closed_dir)
           FileUtils.mv(issue_dir, dest)
 
+          epoch = current_epoch
+          epoch = 1 if epoch == 0  # First closure is epoch 1
+
           File.write(File.join(dest, "close.yaml"), YAML.dump(
             "status" => status,
             "reason" => reason,
-            "closed_at" => Time.now.iso8601
+            "closed_at" => Time.now.iso8601,
+            "epoch" => epoch
           ))
 
           File.write(File.join(dest, "result.md"), "#{reason}\n")
@@ -478,7 +486,10 @@ module Walk
           File.write(File.join(dest, "close.md"),
                      yaml_frontmatter("closed_at" => Time.now.iso8601, "reason" => reason))
 
-          { slug: slug, status: status, reason: reason, dir: dest }
+          # Record in temporal epoch directory
+          record_closure_in_epoch(slug, epoch)
+
+          { slug: slug, status: status, reason: reason, dir: dest, epoch: epoch }
         when "blocked", "deferred"
           File.write(File.join(issue_dir, "close.yaml"), YAML.dump(
             "status" => status,
@@ -559,6 +570,271 @@ module Walk
         body = content.strip
       end
       { frontmatter: frontmatter, title: frontmatter["title"], status: frontmatter["status"], body: body }
+    end
+
+    public  # Tree views are part of public API
+
+    # --- Tree views ---
+
+    # Build discovery tree: parent -> children it spawned.
+    # Returns { roots: [...], children: { slug => [child_slugs] }, issues: { slug => issue } }
+    def build_discovery_tree(include_closed: false)
+      issues = {}
+      parent_of = {}  # child_slug => parent_slug
+
+      # Collect all issues and their discovered_by parents
+      subdirs = include_closed ? %w[open closed] : %w[open]
+      subdirs.each do |subdir|
+        dir = File.join(@walk_dir, subdir)
+        next unless Dir.exist?(dir)
+
+        Dir.glob(File.join(dir, "*")).each do |issue_dir|
+          next unless Dir.exist?(issue_dir)
+
+          issue = subdir == "closed" ? read_closed_issue(issue_dir) : read_issue(issue_dir)
+          next unless issue
+
+          slug = issue[:slug]
+          issue[:status] = subdir
+          issues[slug] = issue
+
+          # Check discovered_by for parent
+          discovered_by_dir = File.join(issue_dir, "discovered_by")
+          if Dir.exist?(discovered_by_dir)
+            Dir.children(discovered_by_dir).each do |entry|
+              path = File.join(discovered_by_dir, entry)
+              next unless File.symlink?(path)
+              # entry is the parent slug
+              parent_of[slug] = entry
+              break  # assume single parent for tree structure
+            end
+          end
+        end
+      end
+
+      # Invert to get children map
+      children = Hash.new { |h, k| h[k] = [] }
+      parent_of.each do |child, parent|
+        children[parent] << child
+      end
+
+      # Sort children by slug for consistent output
+      children.each_value(&:sort!)
+
+      # Find roots (issues with no parent, or parent not in our set)
+      roots = issues.keys.select { |slug| !parent_of[slug] || !issues[parent_of[slug]] }
+      roots.sort!
+
+      { roots: roots, children: children, issues: issues, parent_of: parent_of }
+    end
+
+    # Build blocking tree: shows what blocks what.
+    # Returns { roots: [...], blocked_by: { slug => [blocker_slugs] }, issues: { slug => issue } }
+    def build_blocking_tree(include_closed: false)
+      issues = {}
+      blocked_by = Hash.new { |h, k| h[k] = [] }
+
+      subdirs = include_closed ? %w[open closed] : %w[open]
+      subdirs.each do |subdir|
+        dir = File.join(@walk_dir, subdir)
+        next unless Dir.exist?(dir)
+
+        Dir.glob(File.join(dir, "*")).each do |issue_dir|
+          next unless Dir.exist?(issue_dir)
+
+          issue = subdir == "closed" ? read_closed_issue(issue_dir) : read_issue(issue_dir)
+          next unless issue
+
+          slug = issue[:slug]
+          issue[:status] = subdir
+          issues[slug] = issue
+
+          # Check blocked_by
+          blocked_by_dir = File.join(issue_dir, "blocked_by")
+          if Dir.exist?(blocked_by_dir)
+            Dir.children(blocked_by_dir).each do |entry|
+              path = File.join(blocked_by_dir, entry)
+              next unless File.symlink?(path)
+              blocked_by[slug] << entry
+            end
+          end
+        end
+      end
+
+      blocked_by.each_value(&:sort!)
+
+      # Roots are issues that aren't blocked by anything
+      roots = issues.keys.select { |slug| blocked_by[slug].empty? }
+      roots.sort!
+
+      { roots: roots, blocked_by: blocked_by, issues: issues }
+    end
+
+    # Render discovery tree as text.
+    def render_discovery_tree(tree, root: nil, prefix: "", is_last: true, output: [])
+      roots = root ? [root] : tree[:roots]
+
+      roots.each_with_index do |slug, idx|
+        issue = tree[:issues][slug]
+        next unless issue
+
+        is_last_root = (idx == roots.length - 1)
+        connector = root ? (is_last ? "└── " : "├── ") : ""
+        status_mark = issue[:status] == "closed" ? "✓" : "○"
+        close_reason = issue[:close_reason] ? " — #{issue[:close_reason][0, 40]}" : ""
+
+        output << "#{prefix}#{connector}#{status_mark} #{slug}: #{issue[:title][0, 50]}#{close_reason}"
+
+        children = tree[:children][slug] || []
+        children.each_with_index do |child_slug, cidx|
+          child_is_last = (cidx == children.length - 1)
+          child_prefix = prefix + (root ? (is_last ? "    " : "│   ") : "")
+          render_discovery_tree(tree, root: child_slug, prefix: child_prefix,
+                                is_last: child_is_last, output: output)
+        end
+      end
+
+      output
+    end
+
+    # Render blocking tree as text (shows execution order).
+    def render_blocking_tree(tree, output: [])
+      # Show issues grouped by "depth" in blocking graph
+      issues = tree[:issues]
+      blocked_by = tree[:blocked_by]
+
+      # Compute depths: issues with no blockers are depth 0
+      depths = {}
+      remaining = issues.keys.dup
+
+      depth = 0
+      while remaining.any?
+        at_depth = remaining.select do |slug|
+          blockers = blocked_by[slug]
+          blockers.all? { |b| depths[b] }  # all blockers have depth assigned
+        end
+
+        break if at_depth.empty?  # cycle or orphan blockers
+
+        at_depth.each { |slug| depths[slug] = depth }
+        remaining -= at_depth
+        depth += 1
+      end
+
+      # Assign remaining (cycles or missing blockers) to max depth
+      remaining.each { |slug| depths[slug] = depth }
+
+      # Group and render
+      by_depth = issues.keys.group_by { |slug| depths[slug] || 0 }
+      by_depth.keys.sort.each do |d|
+        output << "=== Depth #{d} ==="
+        by_depth[d].sort.each do |slug|
+          issue = issues[slug]
+          status_mark = issue[:status] == "closed" ? "✓" : "○"
+          blockers = blocked_by[slug]
+          blocker_str = blockers.any? ? " [blocked by: #{blockers.join(', ')}]" : ""
+          output << "  #{status_mark} #{slug}: #{issue[:title][0, 50]}#{blocker_str}"
+        end
+        output << ""
+      end
+
+      output
+    end
+
+    # --- Temporal epochs (planning rounds) ---
+
+    # Get current epoch number (0 if no epochs yet)
+    def current_epoch
+      current_file = File.join(@walk_dir, "epochs", "current")
+      return 0 unless File.exist?(current_file)
+      File.read(current_file).strip.to_i
+    end
+
+    # Increment epoch and return new value. Creates epochs/ dir if needed.
+    def increment_epoch
+      with_walk_lock do
+        epochs_dir = File.join(@walk_dir, "epochs")
+        FileUtils.mkdir_p(epochs_dir)
+
+        new_epoch = current_epoch + 1
+        epoch_dir = File.join(epochs_dir, new_epoch.to_s)
+        FileUtils.mkdir_p(epoch_dir)
+
+        File.write(File.join(epochs_dir, "current"), new_epoch.to_s)
+        new_epoch
+      end
+    end
+
+    # Record that an issue was closed in a specific epoch.
+    # Creates symlink: epochs/N/<slug> -> ../../closed/<slug>
+    def record_closure_in_epoch(slug, epoch = nil)
+      epoch ||= current_epoch
+      epoch = increment_epoch if epoch == 0  # First closure triggers epoch 1
+
+      epochs_dir = File.join(@walk_dir, "epochs")
+      epoch_dir = File.join(epochs_dir, epoch.to_s)
+      FileUtils.mkdir_p(epoch_dir)
+
+      symlink_path = File.join(epoch_dir, slug)
+      target = "../../closed/#{slug}"
+
+      FileUtils.rm_f(symlink_path)  # Remove if exists (reclose case)
+      File.symlink(target, symlink_path)
+    end
+
+    # List issues closed in a specific epoch.
+    # Returns array of issue hashes (with :epoch field).
+    def issues_in_epoch(epoch)
+      epoch_dir = File.join(@walk_dir, "epochs", epoch.to_s)
+      return [] unless Dir.exist?(epoch_dir)
+
+      Dir.children(epoch_dir).filter_map do |entry|
+        next if entry == "current"
+        path = File.join(epoch_dir, entry)
+        next unless File.symlink?(path)
+
+        # Resolve to closed/ or open/ (if reopened)
+        if File.exist?(path)
+          issue_dir = File.realpath(path)
+        else
+          # Broken symlink - try open/
+          open_dir = File.join(@walk_dir, "open", entry)
+          issue_dir = File.exist?(open_dir) ? open_dir : nil
+        end
+        next unless issue_dir
+
+        issue = issue_dir.include?("/closed/") ? read_closed_issue(issue_dir) : read_issue(issue_dir)
+        issue[:epoch] = epoch if issue
+        issue
+      end.compact
+    end
+
+    # Get recently closed issues from the last N epochs.
+    # Returns { epoch => [issues], ... } for non-empty epochs in window.
+    def recent_closed_issues(window: 2)
+      cur = current_epoch
+      return {} if cur == 0
+
+      start_epoch = [cur - window + 1, 1].max
+      result = {}
+
+      (start_epoch..cur).each do |e|
+        issues = issues_in_epoch(e)
+        result[e] = issues if issues.any?
+      end
+
+      result
+    end
+
+    # List all epoch numbers that exist.
+    def list_epochs
+      epochs_dir = File.join(@walk_dir, "epochs")
+      return [] unless Dir.exist?(epochs_dir)
+
+      Dir.children(epochs_dir)
+        .select { |e| e =~ /^\d+$/ && Dir.exist?(File.join(epochs_dir, e)) }
+        .map(&:to_i)
+        .sort
     end
   end
 end

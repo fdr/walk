@@ -167,6 +167,16 @@ module Walk
 
       cmd = @build_cmd.call(prompt, mode: :stream)
 
+      # Create runs/ symlink before spawning so we can track current work
+      run_symlink = nil
+      if @backend.respond_to?(:walk_dir) && output_file
+        runs_dir = File.join(@backend.walk_dir, "runs")
+        FileUtils.mkdir_p(runs_dir)
+        run_symlink = File.join(runs_dir, issue_id)
+        FileUtils.rm_f(run_symlink)  # Remove stale symlink
+        File.symlink(output_file, run_symlink)
+      end
+
       started_at = Time.now
       pid = if output_file
               spawn(*cmd, out: [output_file, "w"], err: [:child, :out])
@@ -176,6 +186,9 @@ module Walk
 
       exit_code = wait_for_agent(pid)
       finished_at = Time.now
+
+      # Remove the runs/ symlink now that agent is done
+      FileUtils.rm_f(run_symlink) if run_symlink
 
       if output_file && @logs_dir
         digest = extract_digest(output_file, issue_id, exit_code)
@@ -198,6 +211,37 @@ module Walk
       end
 
       cleanup_old_logs if @logs_dir
+
+      # Check for result.md and auto-close (same as capture mode)
+      check_and_close_on_result(issue, issue_id)
+    end
+
+    # Check for result.md or close.yaml and close the issue if present.
+    # Used by both stream and capture modes.
+    def check_and_close_on_result(issue, issue_id)
+      dir = issue[:dir]
+      return :no_dir unless dir
+
+      close_yaml = File.join(dir, "close.yaml")
+      result_file = File.join(dir, "result.md")
+
+      if File.exist?(close_yaml)
+        meta = YAML.safe_load(File.read(close_yaml), permitted_classes: [Time]) || {}
+        reason = meta["reason"] || "completed"
+        with_backend_lock do
+          @backend.close_issue(issue_id, reason: reason, status: meta["status"] || "closed")
+        end
+        log(:info, "Issue #{issue_id} closed via close.yaml")
+        :closed
+      elsif File.exist?(result_file)
+        reason = File.read(result_file).lines.first&.strip || "completed"
+        with_backend_lock { @backend.close_issue(issue_id, reason: reason) }
+        log(:info, "Issue #{issue_id} closed via result.md")
+        :closed
+      else
+        log(:info, "Agent finished without closing #{issue_id}")
+        :open
+      end
     end
 
     def work_issue_capture(issue, issue_id, prompt)
@@ -253,31 +297,17 @@ module Walk
     end
 
     def handle_capture_result(issue, issue_id, stdout, stderr, status)
-      dir = issue[:dir]
-      return :no_dir unless dir
+      result = check_and_close_on_result(issue, issue_id)
 
-      close_yaml = File.join(dir, "close.yaml")
-      result_file = File.join(dir, "result.md")
-
-      if File.exist?(close_yaml)
-        meta = YAML.safe_load(File.read(close_yaml), permitted_classes: [Time]) || {}
-        reason = meta["reason"] || "completed"
-        with_backend_lock do
-          @backend.close_issue(issue_id, reason: reason, status: meta["status"] || "closed")
-        end
-        :closed
-      elsif File.exist?(result_file)
-        reason = File.read(result_file).lines.first&.strip || "completed"
-        with_backend_lock { @backend.close_issue(issue_id, reason: reason) }
-        :closed
-      else
-        log(:info, "Agent finished without closing #{issue_id}")
+      # In capture mode, log stdout/stderr on failure to close
+      if result == :open
         with_backend_lock do
           @backend.add_comment(issue_id,
             "Agent finished without closing.\n\nStdout:\n```\n#{stdout&.slice(0, 2000)}\n```\n\nStderr:\n```\n#{stderr&.slice(0, 500)}\n```")
         end
-        :open
       end
+
+      result
     end
 
     def wait_for_agent(pid)
@@ -330,10 +360,18 @@ module Walk
     def cleanup_old_logs
       return unless @logs_dir
 
-      logs = Dir.glob(File.join(@logs_dir, "*.txt")).sort
-      return if logs.length <= 40
+      # Keep 4 weeks of logs (time-based retention)
+      cutoff = Time.now - (28 * 24 * 60 * 60)
 
-      logs[0...-40].each { |f| File.delete(f) rescue nil }
+      Dir.glob(File.join(@logs_dir, "*-output.jsonl")).each do |output_file|
+        next if File.mtime(output_file) > cutoff
+
+        # Delete the log set (prompt.txt, output.jsonl, digest.json)
+        base = output_file.sub(/-output\.jsonl$/, "")
+        [output_file, "#{base}.txt", "#{base}-digest.json"].each do |f|
+          File.delete(f) rescue nil
+        end
+      end
     end
 
     def log(level, msg)

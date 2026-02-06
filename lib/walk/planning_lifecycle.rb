@@ -39,6 +39,12 @@ module Walk
     # Spawn a planning agent. Returns :dry_run, :skip, :created, :empty,
     # or :completed.
     def spawn_planning_agent(dry_run: false)
+      # Increment epoch at start of each planning round
+      if @backend.respond_to?(:increment_epoch) && !dry_run
+        new_epoch = @backend.increment_epoch
+        log(:info, "Starting planning epoch #{new_epoch}")
+      end
+
       if @backend.respond_to?(:fetch_epic_output)
         epic_id = @parent
         unless epic_id

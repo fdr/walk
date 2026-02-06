@@ -32,6 +32,7 @@ module Walk
       when /^Compare:/i     then :compare
       when /^Experiment:/i  then :experiment
       when /^Fix:/i         then :fix
+      when /^Ablation:/i    then :ablation
       else                       :general
       end
     end
@@ -103,9 +104,10 @@ module Walk
     def preamble_text
       return @preamble if @preamble
 
-      lines = ["You are working in #{@project_dir}."]
+      lines = []
+      lines << "Issue tracker: WALK_DIR=#{@project_dir}"
       if @claude_md_path && File.exist?(@claude_md_path)
-        lines << "Your context file is #{@claude_md_path} - READ IT FIRST."
+        lines << "Project context: #{@claude_md_path} - READ IT FIRST."
       end
       lines.join("\n")
     end
@@ -188,31 +190,37 @@ module Walk
     # Shared epilogue structure used by both backends.
     # Accepts a hash of backend-specific snippets:
     #   :driver_protocol       - scope, progress docs, close commands
-    #   :live_comment_watching  - (optional) bd-specific comment watching
     #   :git_branch_doc         - how to document git branch name
     def build_shared_epilogue(snippets)
       parts = [snippets[:driver_protocol]]
-      parts << snippets[:live_comment_watching] if snippets[:live_comment_watching]
       parts << <<~GIT.chomp
         GIT HYGIENE (MANDATORY -- other agents share these trees):
         If you modify source code in any shared repo:
         1. EXPLORE first: run `git branch` and `git log --oneline --all --graph | head -30`
-        2. Make atomic commits with clear messages describing what and why
-        3. After building and testing, verify the branch is clean (git status)
-        4. NEVER leave uncommitted changes -- commit or stash before exiting
-        5. NEVER force-push or delete existing branches
-        6. NEVER commit to master/main directly
-        7. #{snippets[:git_branch_doc]}
+           to understand the branch topology. Other agents may have created branches
+           with fixes you need. Branch names are descriptive.
+        2. DECIDE where to base your work:
+           - If a branch already has the fix/feature you need, branch from it or commit on it
+           - If starting fresh, branch from the most relevant existing branch
+           - Bug fixes: fix-<thing> (e.g., fix-vhost-polling)
+           - Experiments: experiment/<thing> (e.g., experiment/gso-batching)
+        3. Make atomic commits with clear messages describing what and why
+        4. After building and testing, verify the branch is clean (git status)
+        5. NEVER leave uncommitted changes -- commit or stash before exiting
+        6. NEVER force-push or delete existing branches
+        7. NEVER commit to master/main directly
+        8. #{snippets[:git_branch_doc]}
       GIT
       parts << <<~NAMING.chomp
         SUB-ISSUE NAMING (optional prefixes, helps driver pick instructions):
-        - Investigate: - research/analysis
-        - Instrument: - adding logging/tracing
-        - Trace: - following execution flow
-        - Compare: - A vs B comparisons
-        - Experiment: - trying things
-        - Fix: - implementing fixes
-        Or just use a descriptive title - the driver will give general instructions.
+        - Investigate: - research/analysis, understanding behavior
+        - Experiment: - trying things, running benchmarks
+        - Compare: - A vs B measurements
+        - Fix: - implementing and verifying fixes
+        - Trace: - following execution flow through code
+        - Instrument: - adding logging/tracing to code
+        - Ablation: - removing/simplifying code to test necessity
+        Or just use a descriptive title.
       NAMING
       parts.join("\n\n")
     end
@@ -296,7 +304,6 @@ module Walk
 
     def build_directory_planning_prompt(claude_md, backend)
       meta = backend.read_walk_meta
-      closed = backend.list_issues(status: "closed")
       walk_dir = backend.walk_dir
       open_dir = File.join(walk_dir, "open")
 
@@ -306,20 +313,49 @@ module Walk
         "## Walk\n\n(No _walk.md found.)"
       end
 
-      closed_context = if closed.empty?
+      # Get recently closed issues from temporal epochs (planning rounds)
+      recent_by_epoch = backend.recent_closed_issues(window: 2)
+      current_epoch = backend.current_epoch
+      total_closed = backend.list_issues(status: "closed").size
+
+      # Build discovery tree for parent annotations
+      tree = backend.build_discovery_tree(include_closed: true)
+      parent_of = tree[:parent_of]
+
+      closed_context = if recent_by_epoch.empty?
         "No closed issues yet."
       else
-        closed.map { |i|
-          parts = ["### #{i[:slug]} -- #{i[:title]}"]
-          parts << "Type: #{i[:type]} | Closed: #{i[:closed_at]}"
-          parts << "Close reason: #{i[:close_reason]}" if i[:close_reason]
-          if i[:result]
-            parts << ""
-            parts << "**Result:**"
-            parts << i[:result]
+        epoch_sections = recent_by_epoch.sort.map do |epoch, issues|
+          issue_lines = issues.map do |i|
+            parent = parent_of[i[:slug]]
+            parent_note = parent ? " (from #{parent})" : ""
+            parts = ["### #{i[:slug]}#{parent_note} -- #{i[:title]}"]
+            parts << "Close reason: #{i[:close_reason]}" if i[:close_reason]
+            if i[:result]
+              result_preview = i[:result].to_s[0, 500]
+              result_preview += "..." if i[:result].to_s.length > 500
+              parts << "Result: #{result_preview}"
+            end
+            parts.join("\n")
           end
-          parts.join("\n")
-        }.join("\n\n---\n\n")
+          "## Epoch #{epoch} (#{issues.size} issues closed)\n\n#{issue_lines.join("\n\n")}"
+        end
+
+        header = "Showing epochs #{recent_by_epoch.keys.min}-#{recent_by_epoch.keys.max} " \
+                 "(#{recent_by_epoch.values.flatten.size} recent). Total closed: #{total_closed}."
+        "#{header}\n\n#{epoch_sections.join("\n\n---\n\n")}"
+      end
+
+      # Show open issues separately
+      open_issues = backend.list_issues(status: "open")
+      open_context = if open_issues.empty?
+        "No open issues."
+      else
+        open_issues.map { |i|
+          parent = parent_of[i[:slug]]
+          parent_note = parent ? " (from #{parent})" : ""
+          "- #{i[:slug]}#{parent_note}: #{i[:title]}"
+        }.join("\n")
       end
 
       claude_md_section = if claude_md.empty?
@@ -328,22 +364,50 @@ module Walk
         "\n---\n\n#{claude_md}\n\n---\n"
       end
 
+      # Epoch info for planner
+      all_epochs = backend.list_epochs
+      epoch_info = if current_epoch == 0
+        "No epochs yet (this will be epoch 1)."
+      else
+        "Current epoch: #{current_epoch}. All epochs: #{all_epochs.join(', ')}."
+      end
+
       snippets = {
         preamble: <<~S,
           You are a planning agent for a walk exploration.
           Working directory: #{walk_dir}
+
+          ## Epochs (Planning Rounds)
+
+          #{epoch_info}
+
+          Each epoch represents one planning round. Issues closed since last planning
+          appear in the current epoch. When you create new issues, they will be worked
+          on and closed in the NEXT epoch.
+
+          Your context window shows the last 2 epochs. If you need to trace back further
+          (e.g., to understand a discovery chain), you can read earlier epochs:
+            ls #{walk_dir}/epochs/          # list all epochs
+            ls #{walk_dir}/epochs/3/        # issues closed in epoch 3
+
           #{claude_md_section}
           #{walk_section}
 
-          ## Closed Issues (what has been done so far)
+          ## Recently Closed (epochs #{recent_by_epoch.keys.min || '?'}-#{recent_by_epoch.keys.max || '?'})
 
           #{closed_context}
+
+          ## Open Issues (still in progress)
+
+          #{open_context}
         S
         exploration_steps: <<~S,
-          Review the closed issues above. Then:
-          1. Check for result files in closed issue directories
+          Review the recently closed issues above. These are what was accomplished in
+          the last planning round(s). Then:
+          1. Check result files in closed issue directories for detailed findings
           2. Check git state of repos that were modified: git log --oneline -5 in relevant repos
-          3. Read any source files that recent issues referenced as changed
+          3. Follow discovery links (issues say "from <parent>") to understand context
+          4. If needed, look back at earlier epochs: ls #{walk_dir}/epochs/<N>/
         S
         recording_instruction: '"Write findings to result.md in the issue directory"',
         traceability: <<~S,
@@ -481,23 +545,49 @@ module Walk
         #{create_how_to}
         ### Issue types and what the downstream worker will be told
 
-        Choose the right type. The worker agent receives type-specific instructions:
+        Choose the right type. The worker agent receives type-specific instructions.
+        Adapt these descriptions to your specific context when writing the issue:
 
-        **Investigate:** Worker is told to search source code, read files, document
-        findings, and create child issues. USE FOR: tracing code paths, analyzing
-        architecture, understanding why something behaves a certain way.
+        **Investigate:** Worker searches source code, reads files, documents findings,
+        creates child issues for actionable items. USE WHEN: tracing code paths,
+        analyzing architecture, understanding why something behaves a certain way.
+        The worker generates many tokens reading and annotating source.
+        SUCCESS = documented understanding, not code changes.
 
-        **Experiment:** Worker is told to try an approach, capture output/logs,
-        analyze results, and create follow-ups. USE FOR: testing a specific
-        hypothesis, running a benchmark, trying a configuration change.
+        **Experiment:** Worker tries an approach, captures output/logs, analyzes
+        results, creates follow-ups. USE WHEN: testing a hypothesis, running a
+        benchmark, trying a configuration change. The issue should specify what
+        to try and what to measure. SUCCESS = data captured and interpreted.
 
-        **Compare:** Worker is told to run scenarios, capture data from each
-        variant, identify differences, and produce a comparison. USE FOR:
-        A vs B measurements, before/after benchmarks.
+        **Compare:** Worker runs multiple scenarios, captures data from each,
+        identifies differences. USE WHEN: A vs B measurements, before/after
+        benchmarks, platform comparisons. The issue should specify both variants
+        and what metrics to capture. SUCCESS = comparison table with analysis.
 
-        **Fix:** Worker is told to implement a fix, rebuild, test, and verify
-        the original problem is resolved. USE FOR: known bugs with a proposed
-        solution or clear direction.
+        **Fix:** Worker implements a change, rebuilds, tests, verifies. USE WHEN:
+        known bugs with proposed solution or clear direction. CRITICAL: the issue
+        description must specify acceptance criteria beyond "compiles and runs" —
+        e.g., "benchmark numbers showing improvement," "crash does not reproduce
+        under test X." Without this, workers will close after a smoke test
+        (observed repeatedly).
+
+        **Trace:** Worker follows execution flow through specified code paths,
+        documents the call chain and key decision points. USE WHEN: understanding
+        how data flows through a pipeline, identifying where a transformation
+        happens. SUCCESS = documented sequence with file:line references.
+
+        **Instrument:** Worker adds logging/tracing to code paths, rebuilds,
+        verifies output. USE WHEN: you need runtime data that isn't available
+        from source reading alone. The issue should specify what events to
+        capture and where to add instrumentation.
+
+        **Ablation:** Worker investigates removing or simplifying code and
+        testing for lack of failures or performance regression. USE WHEN: a
+        mechanism might be unnecessary — branches, conditionals, expressions,
+        or even entire functions. When possible, bigger ablations in exchange
+        for shorter code are better. Overall system function should not be
+        impaired. SUCCESS = detailed comments on any differences caused by
+        the ablation, or confirmation that the ablation is safe.
 
         ### Required fields for each issue
 
@@ -587,6 +677,15 @@ module Walk
           - Verify the original problem is resolved
           - Document any side effects or limitations
           - Close with description of fix and test results
+        TASK
+        ablation: <<~TASK,
+          ABLATION TASK:
+          - Identify the mechanism to remove or simplify (branch, conditional, function)
+          - Make the change and rebuild
+          - Run tests to verify system function is not impaired
+          - Measure for performance regression if applicable
+          - Document detailed observations on any differences caused
+          - Close with confirmation the ablation is safe, or explanation of why it's needed
         TASK
         general: <<~TASK
           TASK:

@@ -165,9 +165,13 @@ def cmd_run(args)
     close_protocol: effective_close_protocol
   )
 
+  # Default logs_dir to walk_dir/logs/ for stream mode output capture
+  effective_logs_dir = walk_config[:logs_dir] || File.join(walk_dir, "logs")
+
   driver = Walk::Driver.new(
     backend: backend,
     prompt_builder: prompt_builder,
+    logs_dir: effective_logs_dir,
     spawn_mode: effective_spawn_mode,
     max_turns: effective_max_turns,
     sleep_interval: effective_sleep_interval,
@@ -583,9 +587,153 @@ def cmd_list(args)
   end
 end
 
+# --- Subcommand: tree ---
+
+def cmd_tree(args)
+  mode = :discovery
+  json_output = false
+  root_slug = nil
+  include_closed = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk tree <name> [--mode discovery|blocking] [--root SLUG] [--all]"
+    opts.on("--mode MODE", "Tree type: discovery (default) or blocking") { |m| mode = m.to_sym }
+    opts.on("--root SLUG", "Start tree from specific issue") { |r| root_slug = r }
+    opts.on("--all", "Include closed issues (default: open only)") { include_closed = true }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+
+  case mode
+  when :discovery
+    tree = backend.build_discovery_tree(include_closed: include_closed)
+    if json_output
+      puts JSON.pretty_generate(tree.slice(:roots, :children, :parent_of).merge(
+        issues: tree[:issues].transform_values { |i| { slug: i[:slug], title: i[:title], status: i[:status] } }
+      ))
+    else
+      lines = backend.render_discovery_tree(tree, root: root_slug)
+      puts lines.join("\n")
+    end
+  when :blocking
+    tree = backend.build_blocking_tree(include_closed: include_closed)
+    if json_output
+      puts JSON.pretty_generate(tree.slice(:roots, :blocked_by).merge(
+        issues: tree[:issues].transform_values { |i| { slug: i[:slug], title: i[:title], status: i[:status] } }
+      ))
+    else
+      lines = backend.render_blocking_tree(tree)
+      puts lines.join("\n")
+    end
+  else
+    $stderr.puts "Unknown mode: #{mode}. Use 'discovery' or 'blocking'."
+    exit 1
+  end
+end
+
 # ---------------------------------------------------------------------------
 # Main dispatch
 # ---------------------------------------------------------------------------
+
+# --- Subcommand: epochs ---
+
+def cmd_epochs(args)
+  init_mode = false
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk epochs <name> [--init]"
+    opts.on("--init", "Backfill epochs from closed_at timestamps") { init_mode = true }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+
+  if init_mode
+    # Backfill epochs from closed_at timestamps (group by day)
+    closed = backend.list_issues(status: "closed")
+    if closed.empty?
+      puts "No closed issues to backfill."
+      return
+    end
+
+    # Group by date (closed_at day)
+    by_date = closed.group_by { |i|
+      # Parse closed_at, fall back to "unknown"
+      if i[:closed_at]
+        Time.parse(i[:closed_at].to_s).strftime("%Y-%m-%d") rescue "unknown"
+      else
+        "unknown"
+      end
+    }
+
+    # Sort dates and assign epochs
+    sorted_dates = by_date.keys.sort
+    puts "Backfilling #{closed.size} issues across #{sorted_dates.size} dates..."
+
+    epochs_dir = File.join(walk_dir, "epochs")
+    FileUtils.mkdir_p(epochs_dir)
+
+    sorted_dates.each_with_index do |date, idx|
+      epoch = idx + 1
+      epoch_dir = File.join(epochs_dir, epoch.to_s)
+      FileUtils.mkdir_p(epoch_dir)
+
+      issues = by_date[date]
+      issues.each do |issue|
+        slug = issue[:slug]
+        symlink_path = File.join(epoch_dir, slug)
+        target = "../../closed/#{slug}"
+        FileUtils.rm_f(symlink_path)
+        File.symlink(target, symlink_path)
+      end
+
+      puts "  Epoch #{epoch} (#{date}): #{issues.size} issues"
+    end
+
+    # Update current epoch
+    File.write(File.join(epochs_dir, "current"), sorted_dates.size.to_s)
+    puts "Done. Current epoch: #{sorted_dates.size}"
+  else
+    # Show epoch info
+    current = backend.current_epoch
+    all_epochs = backend.list_epochs
+
+    if json_output
+      data = {
+        current_epoch: current,
+        epochs: all_epochs.map { |e| { epoch: e, count: backend.issues_in_epoch(e).size } }
+      }
+      puts JSON.pretty_generate(data)
+    else
+      if all_epochs.empty?
+        puts "No epochs yet. Run 'walk epochs --init' to backfill from existing issues."
+      else
+        puts "Current epoch: #{current}"
+        puts "All epochs:"
+        all_epochs.each do |e|
+          issues = backend.issues_in_epoch(e)
+          puts "  #{e}: #{issues.size} issues"
+        end
+      end
+    end
+  end
+end
 
 SUBCOMMANDS = {
   "new"     => method(:cmd_new),
@@ -593,12 +741,14 @@ SUBCOMMANDS = {
   "status"  => method(:cmd_status),
   "history" => method(:cmd_history),
   "summary" => method(:cmd_summary),
+  "tree"    => method(:cmd_tree),
   "show"    => method(:cmd_show),
   "close"   => method(:cmd_close),
   "comment" => method(:cmd_comment),
   "create"  => method(:cmd_create),
   "list"    => method(:cmd_list),
-  "runs"    => method(:cmd_runs)
+  "runs"    => method(:cmd_runs),
+  "epochs"  => method(:cmd_epochs)
 }.freeze
 
 def main
@@ -616,6 +766,8 @@ def main
         walk status <name>                             Show walk dashboard
         walk history <name>                            Chronological timeline
         walk summary <name>                            Markdown summary report
+        walk tree <name> [--mode MODE] [--root SLUG]   Show issue hierarchy
+              MODE: discovery (parent->children) or blocking (execution order)
 
       Agent-facing (WALK_DIR/WALK_ISSUE env vars, or --walk-dir/--slug flags):
         walk show <slug>                      Show issue details
