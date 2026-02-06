@@ -435,29 +435,28 @@ module Walk
           Then EXIT. The driver reads this file and finalizes the walk.
         S
         create_issue_how_to: <<~S,
-          To create an issue, make a new directory under #{open_dir}/ and write
-          an issue.md file with YAML frontmatter. Example:
+          To create an issue, use the walk CLI:
 
           ```
-          mkdir -p #{open_dir}/investigate-something
-          cat > #{open_dir}/investigate-something/issue.md << 'ISSUE_EOF'
-          ---
-          title: "Investigate something specific"
-          type: task
-          priority: 2
-          ---
-
-          Description of what to investigate and why.
+          walk create investigate-something \\
+            --title "Investigate something specific" \\
+            --type investigate \\
+            --priority 2 \\
+            --body "Description of what to investigate and why.
 
           ## Close with
 
-          What the agent should report when done.
-          ISSUE_EOF
+          What the agent should report when done."
+          ```
+
+          For issues that depend on another issue completing first:
+          ```
+          walk create child-issue --title "..." --blocked-by parent-issue --body "..."
           ```
         S
         verify_and_exit: <<~S
           After creating issues:
-          1. Verify they exist: ls #{open_dir}/
+          1. Verify they exist: walk list (should show your new issues)
           2. Write a result file to signal what happened:
              ```
              cat > #{walk_dir}/_planning_result.md << 'PLANNING_EOF'
@@ -534,7 +533,7 @@ module Walk
         ## Step 4: Create follow-up issues from generative findings
 
         For each generative issue from your triage, create 0-2 follow-up issues.
-        Every follow-up MUST cite its source via --deps discovered-from:<source-id>.
+        Every follow-up MUST cite its source in the issue body: "Discovered from: <source-slug>"
         If a follow-up synthesizes findings from multiple sources, cite all of them.
 
         Do not create issues without a source. If you cannot name which closed
@@ -542,8 +541,9 @@ module Walk
         (Exception: the first planning round with no closed issues creates issues
         based on the epic description.)
 
-        If you have observations that don't yet warrant an issue, leave a comment
-        on the epic as a scratchpad note for the next planning round.
+        If you have observations that don't yet warrant an issue, use:
+          walk comment "Scratchpad note: <your observation>"
+        This adds a note for the next planning round.
 
         Fewer well-specified issues are better than more vague ones.
         #{create_how_to}
@@ -608,7 +608,7 @@ module Walk
         #{snippets[:traceability]}
         ### Anti-patterns to avoid
 
-        - DO NOT create issues without citing a discovered-from source
+        - DO NOT create issues without citing the source issue in the body
           (exception: first planning round with no closed issues)
         - DO NOT create issues with multiple objectives ("investigate A and also try B")
         - DO NOT create issues with vague goals ("improve performance", "investigate further")

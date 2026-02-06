@@ -699,9 +699,9 @@ class WalkDriverTest < Minitest::Test
     write_walk_meta(title: "Instruction Walk")
 
     prompt = @prompt_builder.build_planning_prompt(backend: @backend)
-    assert_includes prompt, "mkdir"
-    assert_includes prompt, "issue.md"
-    assert_includes prompt, File.join(@tmpdir, "open")
+    assert_includes prompt, "walk create"
+    assert_includes prompt, "--title"
+    assert_includes prompt, "--body"
   end
 
   def test_planning_prompt_result_md_includes_verify_and_exit
@@ -730,7 +730,7 @@ class WalkDriverTest < Minitest::Test
 
     # Step 4: create follow-ups
     assert_includes prompt, "Create follow-up issues"
-    assert_includes prompt, "discovered-from"
+    assert_includes prompt, "Discovered from:"
 
     # Issue types
     assert_includes prompt, "**Investigate:**"
