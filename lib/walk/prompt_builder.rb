@@ -20,19 +20,34 @@ module Walk
       @close_protocol = close_protocol
     end
 
-    # Detect issue type from title prefix.
+    # Detect issue type from title prefix or slug pattern.
     def issue_type(issue)
       title = issue[:title] || ""
+      slug = issue[:slug] || issue[:id] || ""
 
+      # First try title prefix (canonical)
       case title
-      when /^Investigate:/i then :investigate
-      when /^Instrument:/i  then :instrument
-      when /^Trace:/i       then :trace
-      when /^Test:/i        then :test
-      when /^Compare:/i     then :compare
-      when /^Experiment:/i  then :experiment
-      when /^Fix:/i         then :fix
-      when /^Ablation:/i    then :ablation
+      when /^Investigate:/i then return :investigate
+      when /^Instrument:/i  then return :instrument
+      when /^Trace:/i       then return :trace
+      when /^Test:/i        then return :test
+      when /^Compare:/i     then return :compare
+      when /^Experiment:/i  then return :experiment
+      when /^Fix:/i         then return :fix
+      when /^Ablation:/i    then return :ablation
+      end
+
+      # Fallback: check slug pattern (planners often use descriptive slugs)
+      case slug
+      when /^investigate-/i then :investigate
+      when /^instrument-/i  then :instrument
+      when /^trace-/i       then :trace
+      when /^test-/i        then :test
+      when /^compare-/i     then :compare
+      when /^experiment-/i  then :experiment
+      when /^benchmark-/i   then :experiment
+      when /^fix-/i         then :fix
+      when /^ablation-/i    then :ablation
       else                       :general
       end
     end
@@ -47,10 +62,10 @@ module Walk
     #
     # backend: a Walk::Backend used to load parent context
     def build_prompt(issue, backend:)
-      type = issue_type(issue)
-      task = task_instructions(type)
       parent_context = backend.load_parent_context(issue)
       claude_md = load_claude_md
+      issue_body = issue[:body] || ""
+      issue_title = issue[:title] || issue[:slug] || issue[:id]
 
       parent_section = if parent_context
         <<~PARENT
@@ -65,7 +80,7 @@ module Walk
         ""
       end
 
-      epilogue = build_epilogue(issue, type)
+      epilogue = build_epilogue(issue, nil)
 
       <<~PROMPT
         #{preamble_text}
@@ -76,10 +91,13 @@ module Walk
         #{parent_section}
         ---
 
-        Issue: #{issue[:id] || issue[:slug]}
-        Type: #{type}
+        ## Issue: #{issue[:id] || issue[:slug]}
 
-        #{task}
+        **#{issue_title}**
+
+        #{issue_body}
+
+        ---
 
         #{epilogue}
       PROMPT
@@ -110,6 +128,16 @@ module Walk
         lines << "Project context: #{@claude_md_path} - READ IT FIRST."
       end
       lines.join("\n")
+    end
+
+    def format_bytes(bytes)
+      if bytes >= 1024 * 1024
+        format("%.1fM", bytes / (1024.0 * 1024))
+      elsif bytes >= 1024
+        format("%.1fK", bytes / 1024.0)
+      else
+        "#{bytes}B"
+      end
     end
 
     def load_claude_md
@@ -318,8 +346,8 @@ module Walk
         "## Walk\n\n(No _walk.md found.)"
       end
 
-      # Get recently closed issues from temporal epochs (planning rounds)
-      recent_by_epoch = backend.recent_closed_issues(window: 2)
+      # Get recently closed issues by size (backwards-chain until ~20KB)
+      recent_by_epoch = backend.recent_closed_issues(min_bytes: 20_000)
       current_epoch = backend.current_epoch
       total_closed = backend.list_issues(status: "closed").size
 
@@ -330,25 +358,43 @@ module Walk
       closed_context = if recent_by_epoch.empty?
         "No closed issues yet."
       else
-        epoch_sections = recent_by_epoch.sort.map do |epoch, issues|
-          issue_lines = issues.map do |i|
+        # Build compact table: Epoch | Slug | Prior (what was attempted) | Bytes
+        total_bytes = recent_by_epoch.values.flatten.sum { |i| i[:result_bytes] || 0 }
+        issues_flat = recent_by_epoch.sort.reverse.flat_map do |epoch, issues|
+          issues.map do |i|
             parent = parent_of[i[:slug]]
-            parent_note = parent ? " (from #{parent})" : ""
-            parts = ["### #{i[:slug]}#{parent_note} -- #{i[:title]}"]
-            parts << "Close reason: #{i[:close_reason]}" if i[:close_reason]
-            if i[:result]
-              result_preview = i[:result].to_s[0, 500]
-              result_preview += "..." if i[:result].to_s.length > 500
-              parts << "Result: #{result_preview}"
-            end
-            parts.join("\n")
+            {
+              epoch: epoch,
+              slug: parent ? "#{i[:slug]} (from #{parent})" : i[:slug],
+              prior: i[:title] || i[:slug],
+              bytes: i[:result_bytes] || 0
+            }
           end
-          "## Epoch #{epoch} (#{issues.size} issues closed)\n\n#{issue_lines.join("\n\n")}"
         end
 
-        header = "Showing epochs #{recent_by_epoch.keys.min}-#{recent_by_epoch.keys.max} " \
-                 "(#{recent_by_epoch.values.flatten.size} recent). Total closed: #{total_closed}."
-        "#{header}\n\n#{epoch_sections.join("\n\n---\n\n")}"
+        # Calculate column widths
+        slug_w = [issues_flat.map { |i| i[:slug].length }.max, 4].max
+        prior_w = [issues_flat.map { |i| i[:prior].length }.max, 24].max
+        bytes_w = 5
+
+        header = "#{issues_flat.size} issues, #{format_bytes(total_bytes)} total. " \
+                 "Epochs #{recent_by_epoch.keys.min}-#{recent_by_epoch.keys.max}. Total closed: #{total_closed}."
+
+        table_header = "| Epoch | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % ["Slug", "Prior (what was attempted)", "Bytes"]
+        table_sep = "|-------|-%s-|-%s-|-%s-|" % ["-" * slug_w, "-" * prior_w, "-" * bytes_w]
+        table_rows = issues_flat.map do |i|
+          "| %5s | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % [i[:epoch], i[:slug], i[:prior], format_bytes(i[:bytes])]
+        end
+
+        <<~TABLE
+          #{header}
+
+          #{table_header}
+          #{table_sep}
+          #{table_rows.join("\n")}
+
+          Use `walk show <slug>` to load full content (body, comments, result).
+        TABLE
       end
 
       # Show open issues separately
@@ -390,8 +436,9 @@ module Walk
           appear in the current epoch. When you create new issues, they will be worked
           on and closed in the NEXT epoch.
 
-          Your context window shows the last 2 epochs. If you need to trace back further
-          (e.g., to understand a discovery chain), you can read earlier epochs:
+          The table below loads recent issues by size (~20KB), spanning however many
+          epochs that requires. Use `walk show <slug>` to expand specific issues.
+          To trace back further (e.g., understand a discovery chain):
             ls #{walk_dir}/epochs/          # list all epochs
             ls #{walk_dir}/epochs/3/        # issues closed in epoch 3
 
@@ -407,12 +454,15 @@ module Walk
           #{open_context}
         S
         exploration_steps: <<~S,
-          Review the recently closed issues above. These are what was accomplished in
-          the last planning round(s). Then:
-          1. Check result files in closed issue directories for detailed findings
-          2. Check git state of repos that were modified: git log --oneline -5 in relevant repos
-          3. Follow discovery links (issues say "from <parent>") to understand context
-          4. If needed, look back at earlier epochs: ls #{walk_dir}/epochs/<N>/
+          The table shows what was *attempted* (prior) and how much context each issue
+          contains (bytes). Before expanding anything:
+
+          1. Scan the table for relevance to epic goals - which issues matter?
+          2. Check git state: git log --oneline -5 in repos that were modified
+          3. Follow discovery links ("from <parent>") to understand investigation chains
+          4. Look at earlier epochs if needed: ls #{walk_dir}/epochs/<N>/
+
+          Then proceed to Step 3 for selective expansion and critical evaluation.
         S
         recording_instruction: '"Write findings to result.md in the issue directory"',
         traceability: <<~S,
@@ -500,9 +550,15 @@ module Walk
         #{snippets[:preamble]}
         ## Your job
 
-        You are the planning agent. Your job is to review what has been learned
-        and decide what to do next: create follow-up issues for generative
-        findings, or recommend closing the epic/walk.
+        You are the planning agent. You write issues that will be executed by an
+        LLM worker agent. Your job is twofold:
+
+        1. Review what was learned and decide what to pursue next
+        2. Craft issue descriptions that will produce good executor behavior
+
+        The closed issues show issue descriptions paired with executor results. Compare
+        what the issue asked for vs what the executor produced. When output diverges
+        from intent, that's signal about the prompt, not just the technical problem.
 
         ## Step 1: Assess epic-level progress
 
@@ -517,104 +573,84 @@ module Walk
         ## Step 2: Deep exploration (REQUIRED before creating issues)
 
         #{snippets[:exploration_steps]}
-        ## Step 3: Triage closed issues (terminal vs generative)
+        ## Step 3: Expand and critically evaluate
 
-        For each closed issue you read in detail, classify it:
+        For each issue you identified as relevant in Step 2, run `walk show <slug>`.
+        Budget by bytes: expanding a 6K issue costs more context than a 2K issue.
+        Skip issues that are clearly tangential or failed for environmental reasons.
 
-        - **Terminal**: Findings are self-contained — fix applied, design consumed
-          by implementation, or investigation answered its question fully.
-          Terminal issues generate 0 follow-ups.
-        - **Generative**: Findings expose new questions, gaps, or implementation
-          needs. Generative issues generate 1-2 follow-ups each.
+        For each expanded issue, evaluate:
 
-        Write your triage before creating any issues. Format:
-        - <id> (<title>): TERMINAL — <one-line rationale>
-        - <id> (<title>): GENERATIVE — <what new question/gap it opens> → N follow-ups
+        **A. Did the executor do the work?**
+        Compare prior (what was attempted, from title) vs posterior (what was produced).
+        - Did they do what was asked, or something adjacent?
+        - Did they use the methods specified, or substitute easier ones?
+        - Did they stop at a blocker, or find a way through?
 
-        ## Step 4: Create follow-up issues from generative findings
+        **B. Is the conclusion trustworthy?**
+        Executor results contain claims. Evaluate critically:
+        - Is there evidence (data, traces, benchmarks) or just reasoning?
+        - Does it contradict findings from other issues?
+        - Did they answer the actual question or deflect?
 
-        For each generative issue from your triage, create 0-2 follow-up issues.
-        Every follow-up MUST cite its source in the issue body: "Discovered from: <source-slug>"
-        If a follow-up synthesizes findings from multiple sources, cite all of them.
+        **C. Terminal or generative?**
+        - **Terminal**: Question answered, fix verified, artifact delivered. No follow-up.
+        - **Generative**: Exposes new questions, gaps, or contradictions. Warrants follow-up.
 
-        Do not create issues without a source. If you cannot name which closed
-        issue's findings warrant the follow-up, the issue is not warranted.
-        (Exception: the first planning round with no closed issues creates issues
-        based on the epic description.)
+        When execution diverged from intent, diagnose:
+        - Vague goal → executor chose its own interpretation
+        - Missing constraints → executor took path of least resistance
+        - No verification criteria → executor declared success without evidence
+        - Escape hatch available → executor rationalized why goal was impossible
 
-        If you have observations that don't yet warrant an issue, use:
-          walk comment "Scratchpad note: <your observation>"
-        This adds a note for the next planning round.
+        Write your triage. Format:
+        ```
+        <slug>: EXPANDED | SKIPPED (reason)
+          Prior: <what was attempted>
+          Posterior: <what was concluded>
+          Trust: <high/medium/low - why>
+          Classification: TERMINAL | GENERATIVE
+          Follow-ups: <what they address, if any>
+        ```
 
-        Fewer well-specified issues are better than more vague ones.
-        #{create_how_to}
-        ### Issue types and what the downstream worker will be told
+        ## Step 4: Create follow-up issues
 
-        Choose the right type. The worker agent receives type-specific instructions.
-        Adapt these descriptions to your specific context when writing the issue:
+        For each generative finding, create 0-2 follow-up issues.
 
-        **Investigate:** Worker searches source code, reads files, documents findings,
-        creates child issues for actionable items. USE WHEN: tracing code paths,
-        analyzing architecture, understanding why something behaves a certain way.
-        The worker generates many tokens reading and annotating source.
-        SUCCESS = documented understanding, not code changes.
+        ### The issue body IS the prompt
 
-        **Experiment:** Worker tries an approach, captures output/logs, analyzes
-        results, creates follow-ups. USE WHEN: testing a hypothesis, running a
-        benchmark, trying a configuration change. The issue should specify what
-        to try and what to measure. SUCCESS = data captured and interpreted.
+        The executor receives your issue body plus minimal driver framing. Everything
+        the executor needs to do the work correctly must be in the issue body.
 
-        **Compare:** Worker runs multiple scenarios, captures data from each,
-        identifies differences. USE WHEN: A vs B measurements, before/after
-        benchmarks, platform comparisons. The issue should specify both variants
-        and what metrics to capture. SUCCESS = comparison table with analysis.
+        Write substantial issues: Goal, Background, Method, Success Criteria, specific
+        commands and file paths. The key addition: **close escape hatches** based on
+        how previous executors failed.
 
-        **Fix:** Worker implements a change, rebuilds, tests, verifies. USE WHEN:
-        known bugs with proposed solution or clear direction. CRITICAL: the issue
-        description must specify acceptance criteria beyond "compiles and runs" —
-        e.g., "benchmark numbers showing improvement," "crash does not reproduce
-        under test X." Without this, workers will close after a smoke test
-        (observed repeatedly).
+        ### Strengthen based on execution history
 
-        **Trace:** Worker follows execution flow through specified code paths,
-        documents the call chain and key decision points. USE WHEN: understanding
-        how data flows through a pipeline, identifying where a transformation
-        happens. SUCCESS = documented sequence with file:line references.
+        When you evaluated execution quality in Step 3, you identified how prompts
+        failed. Use that to strengthen follow-up issues:
 
-        **Instrument:** Worker adds logging/tracing to code paths, rebuilds,
-        verifies output. USE WHEN: you need runtime data that isn't available
-        from source reading alone. The issue should specify what events to
-        capture and where to add instrumentation.
+        - Executor substituted easier work → "Do X. Do NOT do Y instead."
+        - Executor stopped at blocker → include workaround, or create dependency first
+        - Executor produced shallow output → add depth requirements, minimum counts
+        - Executor rationalized impossibility → close the escape: "This is achievable
+          because X demonstrates Y. Find why Z differs."
+        - Executor used wrong tools → specify tools explicitly: "Use perf, not analysis
+          of existing data"
 
-        **Ablation:** Worker investigates removing or simplifying code and
-        testing for lack of failures or performance regression. USE WHEN: a
-        mechanism might be unnecessary — branches, conditionals, expressions,
-        or even entire functions. When possible, bigger ablations in exchange
-        for shorter code are better. Overall system function should not be
-        impaired. SUCCESS = detailed comments on any differences caused by
-        the ablation, or confirmation that the ablation is safe.
-
-        ### Required fields for each issue
-
-        Every issue description MUST include:
-        1. **Goal**: One sentence. What will we know or have when this is done?
-        2. **Hypothesis or deliverable**: What we expect to find, or what artifact to produce
-        3. **Specific starting point**: File paths, function names, commands to run
-        4. **Success criteria**: Quantitative if possible ("throughput > 5 Gbps",
-           "crash does not reproduce"), otherwise a concrete observable
-        5. **Recording instruction**: #{snippets[:recording_instruction]}
+        The goal is iterating on prompt design. Each follow-up should be harder to
+        deflect than the issue that spawned it.
 
         ### Traceability
 
-        #{snippets[:traceability]}
-        ### Anti-patterns to avoid
+        Every follow-up names its source: "Discovered from: <source-slug>".
+        No source = no issue (exception: first planning round).
 
-        - DO NOT create issues without citing the source issue in the body
-          (exception: first planning round with no closed issues)
-        - DO NOT create issues with multiple objectives ("investigate A and also try B")
-        - DO NOT create issues with vague goals ("improve performance", "investigate further")
-        - DO NOT create issues that duplicate recently-closed work
-        - DO NOT create more issues than there are generative findings to follow up
+        #{snippets[:traceability]}
+        #{create_how_to}
+        **Scratchpad**: Observations that don't warrant an issue yet:
+          walk comment "Scratchpad: <observation>"
 
         ## Step 5: Verify and exit
 

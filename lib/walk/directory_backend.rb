@@ -542,8 +542,16 @@ module Walk
       issue = read_issue(dir_path)
       return nil unless issue
 
+      total_bytes = (issue[:body] || "").bytesize
+
       result_file = File.join(dir_path, "result.md")
-      issue[:result] = File.exist?(result_file) ? File.read(result_file).strip : nil
+      if File.exist?(result_file)
+        content = File.read(result_file).strip
+        issue[:result] = content
+        total_bytes += content.bytesize
+      else
+        issue[:result] = nil
+      end
 
       close_yaml = File.join(dir_path, "close.yaml")
       close_md = File.join(dir_path, "close.md")
@@ -567,8 +575,10 @@ module Walk
       if File.exist?(comments_file)
         comments = File.read(comments_file)
         issue[:comments] = comments.length > 2000 ? comments[-2000..] : comments
+        total_bytes += comments.bytesize
       end
 
+      issue[:result_bytes] = total_bytes
       issue
     end
 
@@ -831,21 +841,72 @@ module Walk
       end.compact
     end
 
-    # Get recently closed issues from the last N epochs.
-    # Returns { epoch => [issues], ... } for non-empty epochs in window.
-    def recent_closed_issues(window: 2)
-      cur = current_epoch
-      return {} if cur == 0
+    # Get all closed issues sorted by recency (most recent first).
+    # Uses closed_at timestamp, falls back to epoch number.
+    def all_closed_by_recency
+      closed_dir = File.join(@walk_dir, "closed")
+      return [] unless Dir.exist?(closed_dir)
 
-      start_epoch = [cur - window + 1, 1].max
-      result = {}
+      issues = Dir.glob(File.join(closed_dir, "*")).filter_map do |dir|
+        next unless Dir.exist?(dir)
 
-      (start_epoch..cur).each do |e|
-        issues = issues_in_epoch(e)
-        result[e] = issues if issues.any?
+        issue = read_closed_issue(dir)
+        next unless issue
+
+        # Determine epoch from epochs/ symlinks
+        issue[:epoch] ||= find_epoch_for_issue(issue[:slug])
+        issue
       end
 
-      result
+      # Sort by closed_at (if available) or epoch (descending = most recent first)
+      issues.sort_by { |i| [-(i[:closed_at]&.to_i || 0), -(i[:epoch] || 0)] }
+    end
+
+    # Find which epoch an issue was closed in (by checking symlinks).
+    def find_epoch_for_issue(slug)
+      epochs_dir = File.join(@walk_dir, "epochs")
+      return nil unless Dir.exist?(epochs_dir)
+
+      Dir.children(epochs_dir).each do |epoch_num|
+        next unless epoch_num =~ /^\d+$/
+
+        link_path = File.join(epochs_dir, epoch_num, slug)
+        return epoch_num.to_i if File.symlink?(link_path)
+      end
+      nil
+    end
+
+    # Get recently closed issues by size threshold (backwards-chain until min_bytes).
+    # Returns { epoch => [issues], ... } grouped by epoch for temporal structure.
+    def recent_closed_issues(min_bytes: 20_000, window: nil)
+      # Legacy: if window is specified, use old epoch-bounded behavior
+      if window
+        cur = current_epoch
+        return {} if cur == 0
+
+        start_epoch = [cur - window + 1, 1].max
+        result = {}
+
+        (start_epoch..cur).each do |e|
+          issues = issues_in_epoch(e)
+          result[e] = issues if issues.any?
+        end
+
+        return result
+      end
+
+      # New: collect by bytes until threshold
+      collected = []
+      total_bytes = 0
+
+      all_closed_by_recency.each do |issue|
+        collected << issue
+        total_bytes += issue[:result_bytes] || 0
+        break if total_bytes >= min_bytes
+      end
+
+      # Group by epoch for temporal display
+      collected.group_by { |i| i[:epoch] || 0 }
     end
 
     # List all epoch numbers that exist.
