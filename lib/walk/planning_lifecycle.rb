@@ -102,11 +102,17 @@ module Walk
 
       cmd = @build_cmd.call(prompt, mode: :stream)
 
+      # Use stdin pipe to pass prompt (avoids argv length limits)
+      stdin_r, stdin_w = IO.pipe
       pid = if output_file
-              spawn(*cmd, out: [output_file, "w"], err: [:child, :out])
+              spawn(*cmd, in: stdin_r, out: [output_file, "w"], err: [:child, :out])
             else
-              spawn(*cmd)
+              spawn(*cmd, in: stdin_r)
             end
+      stdin_r.close
+      stdin_w.write(prompt)
+      stdin_w.close
+
       Process.wait(pid)
 
       log(:info, "Planning agent exited at #{Time.now} with status #{$?.exitstatus}")
