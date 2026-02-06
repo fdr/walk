@@ -165,14 +165,11 @@ module Walk
           DRIVER PROTOCOL:
           - Work ONLY on this issue. Do NOT expand scope.
           - Document approach and findings as you go (write notes to #{dir}/comments.md).
-          - Create sub-issues for follow-up work by creating directories under open/ with issue.md files.
+          - Create sub-issues for follow-up work using: walk create <slug> --title "..." --body "..."
           - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
           - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
-          - Close with rationale: write a file called "result.md" in this directory:
-            #{dir}
-            The file should contain your findings/result.
-            The first line of result.md will be used as the close reason.
-          - EXIT immediately after closing. The driver restarts you with fresh context.
+          - TO CLOSE: write result.md in #{dir} (first line = close reason), then EXIT immediately.
+            The driver handles the rest.
         S
         live_comment_watching: <<~S.chomp,
           LIVE FEEDBACK (for user steering during execution):
