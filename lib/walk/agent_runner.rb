@@ -354,6 +354,14 @@ module Walk
       dir = issue[:dir]
       return unless dir
 
+      # Issue may have been closed/moved during execution - find current location
+      unless Dir.exist?(dir)
+        # Try to find new location via backend
+        current_issue = @backend.show_issue(issue[:id] || issue[:slug])
+        dir = current_issue[:dir] if current_issue && current_issue[:dir]
+        return unless dir && Dir.exist?(dir)
+      end
+
       runs_parent = File.join(dir, "runs")
       FileUtils.mkdir_p(runs_parent)
       run_dir = File.join(runs_parent, timestamp)
