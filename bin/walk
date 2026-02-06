@@ -643,6 +643,41 @@ end
 # Main dispatch
 # ---------------------------------------------------------------------------
 
+# --- Subcommand: resume ---
+
+def cmd_resume(args)
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk resume <name>"
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  meta = backend.read_walk_meta
+
+  unless meta && %w[completed stalled stopped].include?(meta[:status])
+    $stderr.puts "Walk is not closed (status: #{meta&.dig(:status) || 'unknown'})"
+    exit 1
+  end
+
+  result = backend.update_walk_status("open")
+
+  output(result, json: json_output) do |r|
+    puts "Resumed walk (was: #{meta[:status]})"
+    if meta[:frontmatter]["finish_reason"]
+      puts "  Previous reason: #{meta[:frontmatter]["finish_reason"]}"
+    end
+  end
+end
+
 # --- Subcommand: epochs ---
 
 def cmd_epochs(args)
@@ -748,6 +783,7 @@ SUBCOMMANDS = {
   "create"  => method(:cmd_create),
   "list"    => method(:cmd_list),
   "runs"    => method(:cmd_runs),
+  "resume"  => method(:cmd_resume),
   "epochs"  => method(:cmd_epochs)
 }.freeze
 
