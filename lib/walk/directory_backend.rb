@@ -757,22 +757,32 @@ module Walk
 
     # Get current epoch number (0 if no epochs yet)
     def current_epoch
-      current_file = File.join(@walk_dir, "epochs", "current")
-      return 0 unless File.exist?(current_file)
-      File.read(current_file).strip.to_i
+      current_link = File.join(@walk_dir, "epochs", "current")
+      return 0 unless File.symlink?(current_link)
+      File.basename(File.readlink(current_link)).to_i
     end
 
     # Increment epoch and return new value. Creates epochs/ dir if needed.
+    # Uses dense numbering based on max existing epoch.
     def increment_epoch
       with_walk_lock do
         epochs_dir = File.join(@walk_dir, "epochs")
         FileUtils.mkdir_p(epochs_dir)
 
-        new_epoch = current_epoch + 1
+        # Find highest existing epoch (dense numbering)
+        existing = Dir.children(epochs_dir)
+          .select { |e| e =~ /^\d+$/ && Dir.exist?(File.join(epochs_dir, e)) }
+          .map(&:to_i)
+        new_epoch = (existing.max || 0) + 1
+
         epoch_dir = File.join(epochs_dir, new_epoch.to_s)
         FileUtils.mkdir_p(epoch_dir)
 
-        File.write(File.join(epochs_dir, "current"), new_epoch.to_s)
+        # Update current symlink
+        current_link = File.join(epochs_dir, "current")
+        FileUtils.rm_f(current_link)
+        File.symlink(new_epoch.to_s, current_link)
+
         new_epoch
       end
     end

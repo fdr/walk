@@ -681,11 +681,11 @@ class WalkDriverTest < Minitest::Test
     ))
     File.write(File.join(dir, "result.md"), "Completed with findings.\nMore details.")
 
-    # Set up epoch directory with current file and symlink
+    # Set up epoch directory with current symlink and issue symlink
     epochs_dir = File.join(@tmpdir, "epochs")
     epoch_dir = File.join(epochs_dir, "1")
     FileUtils.mkdir_p(epoch_dir)
-    File.write(File.join(epochs_dir, "current"), "1")
+    File.symlink("1", File.join(epochs_dir, "current"))
     File.symlink("../../closed/done-task", File.join(epoch_dir, "done-task"))
 
     prompt = @prompt_builder.build_planning_prompt(backend: @backend)
