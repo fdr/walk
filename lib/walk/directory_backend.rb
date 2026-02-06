@@ -122,7 +122,15 @@ module Walk
         # Issue directory was moved by a concurrent thread (e.g. closed by
         # another agent). Safe to skip — the issue is already handled.
         nil
-      end.sort_by { |i| status == "closed" ? (i[:closed_at].to_s) : i[:priority] }
+      end.sort_by do |i|
+        if status == "closed"
+          i[:closed_at].to_s
+        else
+          # .next file bumps to front (priority 0), deleted when issue is closed
+          has_next = File.exist?(File.join(i[:dir], ".next"))
+          [has_next ? 0 : 1, i[:priority]]
+        end
+      end
     end
 
     def show_issue(slug)
@@ -470,6 +478,10 @@ module Walk
           dest = File.join(closed_dir, slug)
           FileUtils.mkdir_p(closed_dir)
           FileUtils.mv(issue_dir, dest)
+
+          # Remove .next file if present (used to bump issue priority)
+          next_file = File.join(dest, ".next")
+          FileUtils.rm_f(next_file)
 
           epoch = current_epoch
           epoch = 1 if epoch == 0  # First closure is epoch 1

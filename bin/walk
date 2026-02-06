@@ -716,8 +716,22 @@ def cmd_follow(args)
 
   # Track file position for tail -f behavior
   last_size = 0
+  check_counter = 0
 
   loop do
+    # Every 10 iterations (~3s), check for newer file
+    check_counter += 1
+    if check_counter >= 10
+      check_counter = 0
+      candidates = Dir.glob(File.join(logs_dir, "*-output.jsonl")).sort_by { |f| File.mtime(f) }
+      newest = candidates.last
+      if newest && newest != log_file
+        puts "\n\e[35m=== Switching to: #{File.basename(newest)} ===\e[0m\n"
+        log_file = newest
+        last_size = 0
+      end
+    end
+
     current_size = File.size(log_file) rescue 0
 
     if current_size > last_size
