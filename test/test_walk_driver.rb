@@ -177,7 +177,7 @@ class WalkDriverTest < Minitest::Test
     prompt = @prompt_builder.build_prompt(issue, backend: @backend)
     assert_includes prompt, "Issue: prompt-test"
     assert_includes prompt, "Type: general"
-    assert_includes prompt, "result.md"
+    assert_includes prompt, "walk close"
   end
 
   def test_build_prompt_includes_issue_dir
@@ -680,6 +680,13 @@ class WalkDriverTest < Minitest::Test
       "closed_at" => "2026-01-30T10:00:00+00:00"
     ))
     File.write(File.join(dir, "result.md"), "Completed with findings.\nMore details.")
+
+    # Set up epoch directory with current file and symlink
+    epochs_dir = File.join(@tmpdir, "epochs")
+    epoch_dir = File.join(epochs_dir, "1")
+    FileUtils.mkdir_p(epoch_dir)
+    File.write(File.join(epochs_dir, "current"), "1")
+    File.symlink("../../closed/done-task", File.join(epoch_dir, "done-task"))
 
     prompt = @prompt_builder.build_planning_prompt(backend: @backend)
     assert_includes prompt, "done-task"

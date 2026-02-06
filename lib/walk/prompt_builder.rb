@@ -168,14 +168,13 @@ module Walk
           - Create sub-issues for follow-up work using: walk create <slug> --title "..." --body "..."
           - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
           - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
-          - TO CLOSE: write result.md in #{dir} (first line = close reason), then EXIT immediately.
-            The driver handles the rest.
+          - TO CLOSE: walk close --reason "Brief summary of what was accomplished"
+            Then EXIT immediately. The driver handles the rest.
 
           VERIFY YOUR WALK OPERATIONS (use walk CLI, not just filesystem):
           - After `walk create <slug>`: run `walk list` to confirm issue appears
           - After `walk comment`: run `walk show` to verify comment was added
-          - If you write files directly (issue.md, result.md): run `walk show` to check state
-          - Prefer `walk comment "..."` over writing to comments.md directly
+          - After `walk close`: the issue moves from open/ to closed/ automatically
         S
         live_comment_watching: <<~S.chomp,
           LIVE FEEDBACK (for user steering during execution):
@@ -193,10 +192,12 @@ module Walk
 
     # Shared epilogue structure used by both backends.
     # Accepts a hash of backend-specific snippets:
-    #   :driver_protocol       - scope, progress docs, close commands
+    #   :driver_protocol        - scope, progress docs, close commands
+    #   :live_comment_watching  - how to check for user feedback during execution
     #   :git_branch_doc         - how to document git branch name
     def build_shared_epilogue(snippets)
       parts = [snippets[:driver_protocol]]
+      parts << snippets[:live_comment_watching] if snippets[:live_comment_watching]
       parts << <<~GIT.chomp
         GIT HYGIENE (MANDATORY -- other agents share these trees):
         If you modify source code in any shared repo:

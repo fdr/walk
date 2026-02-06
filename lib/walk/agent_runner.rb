@@ -223,9 +223,24 @@ module Walk
 
     # Check for result.md or close.yaml and close the issue if present.
     # Used by both stream and capture modes.
+    # Handles both: (1) agent wrote result.md, driver closes, or
+    #               (2) agent called `walk close`, issue already moved.
     def check_and_close_on_result(issue, issue_id)
       dir = issue[:dir]
       return :no_dir unless dir
+
+      # If issue directory no longer exists in open/, check if agent already closed it
+      unless Dir.exist?(dir)
+        if @backend.respond_to?(:walk_dir)
+          closed_dir = File.join(@backend.walk_dir, "closed", issue_id)
+          if Dir.exist?(closed_dir)
+            log(:info, "Issue #{issue_id} already closed by agent (via walk close)")
+            return :closed
+          end
+        end
+        log(:warn, "Issue directory missing: #{dir}")
+        return :no_dir
+      end
 
       close_yaml = File.join(dir, "close.yaml")
       result_file = File.join(dir, "result.md")
