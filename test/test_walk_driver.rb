@@ -1278,9 +1278,10 @@ class WalkDriverTest < Minitest::Test
 
   def test_build_agent_cmd_stream_default
     driver = make_driver
+    # Prompt is now passed via stdin, not -p argument (avoids argv limits)
     cmd = driver.send(:build_agent_cmd, "do stuff", mode: :stream)
     assert_equal ["claude", "--verbose", "--output-format", "stream-json",
-                  "--permission-mode", "bypassPermissions", "-p", "do stuff"], cmd
+                  "--permission-mode", "bypassPermissions"], cmd
   end
 
   def test_build_agent_cmd_stream_with_model
@@ -1288,20 +1289,19 @@ class WalkDriverTest < Minitest::Test
     cmd = driver.send(:build_agent_cmd, "do stuff", mode: :stream)
     assert_includes cmd, "--model"
     assert_includes cmd, "opus"
-    assert_equal "-p", cmd[-2]
-    assert_equal "do stuff", cmd[-1]
+    refute_includes cmd, "-p"  # Prompt via stdin
   end
 
   def test_build_agent_cmd_stream_with_custom_command
     driver = make_driver(command: "my-agent")
     cmd = driver.send(:build_agent_cmd, "do stuff", mode: :stream)
-    assert_equal ["my-agent", "-p", "do stuff"], cmd
+    assert_equal ["my-agent"], cmd  # Prompt via stdin
   end
 
   def test_build_agent_cmd_stream_with_custom_command_array
     driver = make_driver(command: ["my-agent", "--flag"])
     cmd = driver.send(:build_agent_cmd, "do stuff", mode: :stream)
-    assert_equal ["my-agent", "--flag", "-p", "do stuff"], cmd
+    assert_equal ["my-agent", "--flag"], cmd  # Prompt via stdin
   end
 
   def test_build_agent_cmd_capture_default

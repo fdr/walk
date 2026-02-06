@@ -386,18 +386,18 @@ module Walk
     # Build the agent command array. DRYs up the four spawn methods.
     #
     # mode:       :stream or :capture
-    # prompt:     the prompt string (appended with -p for stream mode)
+    # prompt:     the prompt string (passed via stdin to avoid argv limits)
     # max_turns:  override for --max-turns (capture mode only; nil = use @max_turns)
     def build_agent_cmd(prompt, mode:, max_turns: nil)
       case mode
       when :stream
         if @command
-          Array(@command) + ["-p", prompt]
+          Array(@command)
         else
           base = ["claude", "--verbose", "--output-format", "stream-json",
                   "--permission-mode", "bypassPermissions"]
           base += ["--model", @model] if @model
-          base + ["-p", prompt]
+          base
         end
       when :capture
         if @command

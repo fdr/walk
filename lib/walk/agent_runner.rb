@@ -178,11 +178,16 @@ module Walk
       end
 
       started_at = Time.now
+      # Use stdin pipe to pass prompt (avoids argv length limits with large prompts)
+      stdin_r, stdin_w = IO.pipe
       pid = if output_file
-              spawn(*cmd, out: [output_file, "w"], err: [:child, :out])
+              spawn(*cmd, in: stdin_r, out: [output_file, "w"], err: [:child, :out])
             else
-              spawn(*cmd)
+              spawn(*cmd, in: stdin_r)
             end
+      stdin_r.close
+      stdin_w.write(prompt)
+      stdin_w.close
 
       exit_code = wait_for_agent(pid)
       finished_at = Time.now
