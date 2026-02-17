@@ -48,6 +48,7 @@ module Walk
       when /^benchmark-/i   then :experiment
       when /^fix-/i         then :fix
       when /^ablation-/i    then :ablation
+      when /^meta-/i        then :meta
       else                       :general
       end
     end
@@ -253,8 +254,17 @@ module Walk
         - Trace: - following execution flow through code
         - Instrument: - adding logging/tracing to code
         - Ablation: - removing/simplifying code to test necessity
+        - Meta: - improving walk itself (source in ~/walk/)
         Or just use a descriptive title.
       NAMING
+      parts << <<~SELFMOD.chomp
+        SELF-MODIFICATION (for Meta: issues only):
+        Walk source lives in ~/walk/. To modify walk and trigger a restart:
+        1. Edit walk source files (bin/walk, lib/walk/*.rb)
+        2. Verify syntax: ruby -c <modified-file>
+        3. Run: walk self-modify --reason "Brief description of change"
+        This commits, writes a restart marker, and the trampoline restarts walk.
+      SELFMOD
       parts.join("\n\n")
     end
 
@@ -613,6 +623,42 @@ module Walk
           Follow-ups: <what they address, if any>
         ```
 
+        ## Step 3.5: Meta-evaluation (improve walk itself)
+
+        Review executor behavior from the closed issues. Consider:
+
+        - Did executors misunderstand instructions? → The issue body IS the prompt.
+          Fix in prompt_builder.rb (task instructions, epilogue, planning prompt).
+        - Did executors lack CLI features? → Add a new walk subcommand in bin/walk.
+        - Did driver behavior cause problems? → Fix in lib/walk/driver.rb.
+        - Did planning produce poor issue descriptions? → Fix the planning prompt
+          structure in prompt_builder.rb (the build_shared_planning_prompt method).
+        - Were logs too large for effective review? → Consider adding summary
+          extraction or size-limited output to the reporting or agent_runner.
+
+        Walk architecture (for context — read source before modifying):
+        - `bin/walk` — CLI entrypoint, ~1100 lines. All subcommands defined here.
+        - `lib/walk/driver.rb` — Core loop: pick issues, spawn agents, plan.
+          EXIT_CODE_RESTART=42 triggers trampoline restart.
+        - `lib/walk/prompt_builder.rb` — Builds agent and planning prompts.
+          Issue types: investigate, instrument, trace, test, compare, experiment,
+          fix, ablation, meta, general. Each has task_instructions().
+          Planning prompt: 5-step process (assess, explore, evaluate, create, verify).
+        - `lib/walk/agent_runner.rb` — Spawns claude, captures output, detects results.
+        - `lib/walk/planning_lifecycle.rb` — Planning agent spawning, result parsing.
+        - `lib/walk/retry_policy.rb` — Blocks issues after 3 consecutive failures.
+        - `lib/walk/directory_backend.rb` — File-based issue storage (open/, closed/).
+
+        Create 0-1 "Meta: ..." issues per planning round if a concrete improvement
+        exists. Use the `meta` issue type. Be specific: name the file, method, and
+        what to change. The executor for meta issues will modify walk source and call
+        `walk self-modify --reason "..."` to trigger a trampoline restart.
+
+        Be cognizant that executor run logs can be very large (10K+ lines). If you
+        find yourself unable to effectively review executor behavior due to log size,
+        that itself is a meta-improvement opportunity (e.g., add structured summaries,
+        limit output capture, or add a `walk digest` command).
+
         ## Step 4: Create follow-up issues
 
         For each generative finding, create 0-2 follow-up issues.
@@ -727,6 +773,18 @@ module Walk
           - Measure for performance regression if applicable
           - Document detailed observations on any differences caused
           - Close with confirmation the ablation is safe, or explanation of why it's needed
+        TASK
+        meta: <<~TASK,
+          META-IMPROVEMENT TASK (modifying walk itself):
+          - The walk source lives in ~/walk/ (bin/walk, lib/walk/*.rb)
+          - Read the issue description for what to change
+          - Read the relevant walk source files BEFORE modifying
+          - Make targeted, minimal changes — do not refactor unrelated code
+          - After modifying, run: ruby -c <file> to verify syntax for each changed file
+          - Test your changes if possible (e.g., run `walk --help` to verify CLI changes)
+          - Call `walk self-modify --reason "Brief description"` to commit and request restart
+          - The trampoline will restart walk with your changes on the next iteration
+          - Close with summary of what was changed and why
         TASK
         general: <<~TASK
           TASK:

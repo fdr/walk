@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# bin/walk-trampoline — Self-healing wrapper for walk run.
+#
+# Runs walk in a loop with a backstop repair agent:
+#   Exit 0        = walk completed normally → trampoline exits
+#   Exit 42       = restart requested (self-modification) → syntax check → restart
+#   Exit 130/143  = SIGINT/SIGTERM → trampoline exits
+#   Other         = crash → spawn repair agent → if fixed, restart; else git rollback
+#
+# Usage:
+#   walk-trampoline <walk-dir> [walk-run-flags...]
+#   walk-trampoline ~/walks/debian13-port
+#   walk-trampoline ~/walks/debian13-port --once
+#
+# Environment:
+#   WALK_REPO_DIR    Path to walk source (default: script's grandparent dir)
+#   WALK_MAX_REPAIRS Max consecutive repair attempts before rollback (default: 3)
+
+set -euo pipefail
+
+# Allow nested claude invocations (walk spawns claude agents)
+unset CLAUDECODE 2>/dev/null || true
+unset CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WALK_REPO_DIR="${WALK_REPO_DIR:-$(dirname "$SCRIPT_DIR")}"
+WALK_BIN="${WALK_REPO_DIR}/bin/walk"
+WALK_MAX_REPAIRS="${WALK_MAX_REPAIRS:-3}"
+
+# --- Argument parsing ---
+
+if [ $# -lt 1 ]; then
+  echo "Usage: walk-trampoline <walk-dir> [walk-run-flags...]" >&2
+  exit 1
+fi
+
+WALK_DIR="$1"
+shift
+WALK_RUN_FLAGS=("$@")
+
+if [ ! -d "$WALK_DIR" ]; then
+  echo "Error: walk directory not found: $WALK_DIR" >&2
+  exit 1
+fi
+
+# --- State tracking ---
+
+LOGS_DIR="${WALK_DIR}/logs"
+mkdir -p "$LOGS_DIR"
+
+LAST_GOOD_FILE="${WALK_DIR}/.last_good_commit"
+CONSECUTIVE_FAILURES=0
+RESTART_COUNT=0
+STDERR_FILE="${LOGS_DIR}/trampoline-stderr.log"
+
+# Initialize LAST_GOOD_COMMIT from file or current HEAD
+if [ -f "$LAST_GOOD_FILE" ]; then
+  LAST_GOOD_COMMIT="$(cat "$LAST_GOOD_FILE")"
+else
+  LAST_GOOD_COMMIT="$(cd "$WALK_REPO_DIR" && git rev-parse HEAD)"
+  echo "$LAST_GOOD_COMMIT" > "$LAST_GOOD_FILE"
+fi
+
+log() {
+  echo "[trampoline $(date '+%H:%M:%S')] $*"
+}
+
+# --- Syntax check ---
+
+syntax_check() {
+  log "Running syntax check on walk source..."
+  local failed=0
+  while IFS= read -r -d '' rbfile; do
+    if ! ruby -c "$rbfile" >/dev/null 2>&1; then
+      log "Syntax error in: $rbfile"
+      ruby -c "$rbfile" 2>&1 | head -5
+      failed=1
+    fi
+  done < <(find "$WALK_REPO_DIR/lib" "$WALK_REPO_DIR/bin" -name '*.rb' -print0 2>/dev/null)
+  return $failed
+}
+
+# --- Repair agent ---
+
+spawn_repair_agent() {
+  local exit_code="$1"
+  log "Spawning repair agent (attempt $((CONSECUTIVE_FAILURES + 1))/${WALK_MAX_REPAIRS})..."
+
+  local crash_log=""
+  local driver_log="${LOGS_DIR}/driver.log"
+  if [ -f "$driver_log" ]; then
+    crash_log="$(tail -200 "$driver_log")"
+  fi
+
+  local recent_diff=""
+  recent_diff="$(cd "$WALK_REPO_DIR" && git diff HEAD~3..HEAD 2>/dev/null || echo '(no recent changes)')"
+
+  local stderr_tail=""
+  if [ -f "$STDERR_FILE" ]; then
+    stderr_tail="$(tail -100 "$STDERR_FILE")"
+  fi
+
+  local repair_prompt
+  repair_prompt="walk just crashed with exit code ${exit_code}. Diagnose and fix.
+
+Error output (stderr):
+${stderr_tail}
+
+Recent walk source changes (git diff HEAD~3..HEAD):
+${recent_diff}
+
+Driver log (last 200 lines):
+${crash_log}
+
+The walk source is in ${WALK_REPO_DIR}. Read the failing code, diagnose, and fix.
+After fixing, run: ruby -c <file> to verify syntax.
+If you cannot fix it, run: git checkout -- . to revert all changes."
+
+  # Run repair agent
+  if claude --print --dangerously-skip-permissions --max-turns 15 \
+    -p "$repair_prompt" \
+    > "${LOGS_DIR}/repair-$(date '+%Y%m%d-%H%M%S').log" 2>&1; then
+    log "Repair agent completed."
+    return 0
+  else
+    log "Repair agent failed (exit $?)."
+    return 1
+  fi
+}
+
+# --- Git rollback ---
+
+git_rollback() {
+  log "Rolling back to last good commit: ${LAST_GOOD_COMMIT}"
+  (
+    cd "$WALK_REPO_DIR"
+    # Preserve failed state on a timestamped branch
+    local failed_branch="failed/$(date '+%Y%m%d-%H%M%S')"
+    git branch "$failed_branch" HEAD 2>/dev/null || true
+    log "Failed state preserved on branch: $failed_branch"
+
+    git checkout "$LAST_GOOD_COMMIT" -- . 2>/dev/null
+    git checkout -f 2>/dev/null || true
+  )
+}
+
+# --- Advance good commit ---
+
+advance_good_commit() {
+  local new_commit
+  new_commit="$(cd "$WALK_REPO_DIR" && git rev-parse HEAD)"
+  echo "$new_commit" > "$LAST_GOOD_FILE"
+  LAST_GOOD_COMMIT="$new_commit"
+  log "Advanced LAST_GOOD_COMMIT to $new_commit"
+}
+
+# --- Signal handling ---
+
+TRAPPED_SIGNAL=""
+trap 'TRAPPED_SIGNAL=INT; log "Received SIGINT"' INT
+trap 'TRAPPED_SIGNAL=TERM; log "Received SIGTERM"' TERM
+
+# --- Main loop ---
+
+log "Starting trampoline for: $WALK_DIR"
+log "Walk source: $WALK_REPO_DIR"
+log "Last good commit: $LAST_GOOD_COMMIT"
+
+while true; do
+  if [ -n "$TRAPPED_SIGNAL" ]; then
+    log "Exiting due to SIG${TRAPPED_SIGNAL}."
+    exit 0
+  fi
+
+  RESTART_COUNT=$((RESTART_COUNT + 1))
+  log "=== Run #${RESTART_COUNT} ==="
+
+  # Clear restart marker if present
+  rm -f "${WALK_DIR}/_restart_requested"
+
+  # Run walk
+  set +e
+  "$WALK_BIN" run "$WALK_DIR" "${WALK_RUN_FLAGS[@]}" 2>"$STDERR_FILE"
+  EXIT_CODE=$?
+  set -e
+
+  case $EXIT_CODE in
+    0)
+      log "Walk completed normally (exit 0)."
+      CONSECUTIVE_FAILURES=0
+      advance_good_commit
+      exit 0
+      ;;
+
+    42)
+      log "Restart requested (exit 42). Checking syntax..."
+      CONSECUTIVE_FAILURES=0
+      if syntax_check; then
+        log "Syntax OK. Restarting walk..."
+        continue
+      else
+        log "Syntax check failed after self-modification!"
+        # Try repair
+        if spawn_repair_agent "$EXIT_CODE" && syntax_check; then
+          log "Repair fixed syntax. Restarting..."
+          continue
+        else
+          log "Could not fix syntax. Rolling back."
+          git_rollback
+          continue
+        fi
+      fi
+      ;;
+
+    130|143)
+      log "Walk received signal (exit $EXIT_CODE). Exiting."
+      exit 0
+      ;;
+
+    *)
+      log "Walk crashed (exit $EXIT_CODE)."
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+
+      if [ "$CONSECUTIVE_FAILURES" -ge "$WALK_MAX_REPAIRS" ]; then
+        log "Reached ${WALK_MAX_REPAIRS} consecutive failures. Rolling back."
+        git_rollback
+        CONSECUTIVE_FAILURES=0
+        continue
+      fi
+
+      # Try repair
+      if spawn_repair_agent "$EXIT_CODE" && syntax_check; then
+        log "Repair succeeded. Restarting..."
+        continue
+      else
+        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        if [ "$CONSECUTIVE_FAILURES" -ge "$WALK_MAX_REPAIRS" ]; then
+          log "Repair failed. Reached ${WALK_MAX_REPAIRS} consecutive failures. Rolling back."
+          git_rollback
+          CONSECUTIVE_FAILURES=0
+        else
+          log "Repair failed. Will retry on next iteration."
+        fi
+        continue
+      fi
+      ;;
+  esac
+done

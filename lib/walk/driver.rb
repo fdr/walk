@@ -20,6 +20,7 @@ require_relative "agent_runner"
 module Walk
   class Driver
     MAX_PLANNING_ROUNDS = 3
+    EXIT_CODE_RESTART = 42
 
     # Options:
     #   backend:        a Walk::Backend instance
@@ -95,6 +96,8 @@ module Walk
       else
         run_sequential(once: once, dry_run: dry_run)
       end
+    rescue SystemExit
+      raise
     rescue => e
       log :error, "Driver crashed: #{e.class}: #{e.message}"
       log :error, e.backtrace.first(10).join("\n")
@@ -158,10 +161,21 @@ module Walk
 
     # --- Sequential loop (max_concurrent == 1, once, or dry_run) ---
 
+    def check_restart_requested
+      marker = File.join(@backend.walk_dir, "_restart_requested")
+      if File.exist?(marker)
+        log :info, "Restart marker found. Exiting with code #{EXIT_CODE_RESTART}."
+        File.delete(marker)
+        exit EXIT_CODE_RESTART
+      end
+    end
+
     def run_sequential(once: false, dry_run: false)
       planning_rounds = 0
 
       loop do
+        check_restart_requested
+
         if @shutdown_requested
           log :info, "Shutdown requested, exiting sequential loop."
           finalize_walk("stopped", reason: "signal")
@@ -222,6 +236,8 @@ module Walk
       active_threads = {}  # issue_id => { thread:, issue: }
 
       loop do
+        check_restart_requested
+
         if @shutdown_requested
           log :info, "Shutdown requested, draining #{active_threads.size} active thread(s)..."
           drain_active_threads(active_threads)
@@ -404,7 +420,11 @@ module Walk
           Array(@command)
         else
           base = ["claude", "--print", "--dangerously-skip-permissions"]
-          turns = max_turns || @max_turns
+          turns = if max_turns == :extended && @max_turns
+                    @max_turns * AgentRunner::EXTENDED_TURN_MULTIPLIER
+                  else
+                    max_turns || @max_turns
+                  end
           base += ["--max-turns", turns.to_s] if turns
           base += ["--model", @model] if @model
           base

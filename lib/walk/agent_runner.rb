@@ -264,11 +264,21 @@ module Walk
       end
     end
 
+    # Issue types that typically need more turns (code changes, testing, committing).
+    EXTENDED_TURN_TYPES = %i[fix meta ablation].freeze
+    EXTENDED_TURN_MULTIPLIER = 2
+
     def work_issue_capture(issue, issue_id, prompt)
+      type = @prompt_builder.issue_type(issue)
+      if EXTENDED_TURN_TYPES.include?(type)
+        log(:info, "Issue type :#{type} — using extended max_turns (#{EXTENDED_TURN_MULTIPLIER}x)")
+      end
+
       log(:info, "Spawning Claude agent (capture mode)...")
       with_backend_lock { @backend.add_comment(issue_id, "Agent spawned by walk driver") }
 
-      cmd = @build_cmd.call(prompt, mode: :capture)
+      max_turns_for_type = EXTENDED_TURN_TYPES.include?(type) ? :extended : nil
+      cmd = @build_cmd.call(prompt, mode: :capture, max_turns: max_turns_for_type)
 
       env = {}
       # Set env vars for directory-backend agents
@@ -302,6 +312,18 @@ module Walk
       log(:info, "Agent exit status: #{status.exitstatus}")
 
       # Write run artifacts
+      # Issue may have been closed/moved during execution - relocate run_dir
+      if run_dir && !Dir.exist?(run_dir)
+        current_issue = @backend.show_issue(issue[:id] || issue[:slug])
+        if current_issue && current_issue[:dir] && Dir.exist?(current_issue[:dir])
+          runs_parent = File.join(current_issue[:dir], "runs")
+          FileUtils.mkdir_p(runs_parent)
+          run_dir = File.join(runs_parent, started_at.strftime("%Y%m%d-%H%M%S"))
+          FileUtils.mkdir_p(run_dir)
+        else
+          run_dir = nil
+        end
+      end
       if run_dir
         File.write(File.join(run_dir, "output.txt"), stdout || "")
         File.write(File.join(run_dir, "stderr.txt"), stderr || "")
