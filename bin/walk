@@ -27,6 +27,7 @@ require "fileutils"
 require "time"
 require "optparse"
 require "shellwords"
+require "logger"
 
 require_relative "../lib/walk/directory_backend"
 require_relative "../lib/walk/prompt_builder"
@@ -152,7 +153,7 @@ def cmd_run(args)
     walk_config[:claude_md_path] ||
     (File.exist?(File.join(walk_dir, "CLAUDE.md")) ? File.join(walk_dir, "CLAUDE.md") : nil)
   effective_close_protocol = walk_config.fetch(:close_protocol, :result_md)
-  effective_spawn_mode = walk_config.fetch(:spawn_mode, :capture)
+  effective_spawn_mode = walk_config.fetch(:spawn_mode, :stream)
   effective_max_turns = walk_config.fetch(:max_turns, 10)
   effective_sleep_interval = walk_config.fetch(:sleep_interval, 5)
   effective_model = walk_config[:model]
@@ -169,6 +170,12 @@ def cmd_run(args)
   # Default logs_dir to walk_dir/logs/ for stream mode output capture
   effective_logs_dir = walk_config[:logs_dir] || File.join(walk_dir, "logs")
 
+  # Create a Logger that writes to logs/driver.log
+  FileUtils.mkdir_p(effective_logs_dir)
+  driver_log_path = File.join(effective_logs_dir, "driver.log")
+  driver_logger = Logger.new(driver_log_path, 5, 10 * 1024 * 1024) # 5 rotated files, 10MB each
+  driver_logger.level = Logger::DEBUG
+
   driver = Walk::Driver.new(
     backend: backend,
     prompt_builder: prompt_builder,
@@ -178,7 +185,8 @@ def cmd_run(args)
     sleep_interval: effective_sleep_interval,
     model: effective_model,
     max_concurrent: effective_max_concurrent,
-    command: command
+    command: command,
+    logger: driver_logger
   )
 
   if preview
