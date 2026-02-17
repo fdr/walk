@@ -12,6 +12,13 @@
 #   entire group is killed — preventing orphaned claude agents from interleaving
 #   with new runs.
 #
+# Mutual exclusion:
+#   A PID file (WALK_DIR/.trampoline.pid) prevents multiple trampolines from
+#   running for the same walk directory. On startup, any existing trampoline is
+#   killed. Orphaned claude agents (ppid=1) referencing the walk directory are
+#   also killed. The PID file is cleaned up on all exit paths (normal, signal,
+#   crash) via an EXIT trap.
+#
 # Pristine worktree:
 #   Maintains WALK_REPO_DIR-pristine/ at LAST_GOOD_COMMIT for side-by-side
 #   comparison during repair. The repair agent can diff modified vs pristine
@@ -60,6 +67,7 @@ LOGS_DIR="${WALK_DIR}/logs"
 mkdir -p "$LOGS_DIR"
 
 LAST_GOOD_FILE="${WALK_DIR}/.last_good_commit"
+LOCKFILE="${WALK_DIR}/.trampoline.pid"
 CONSECUTIVE_FAILURES=0
 RESTART_COUNT=0
 STDERR_FILE="${LOGS_DIR}/trampoline-stderr.log"
@@ -75,6 +83,68 @@ fi
 
 log() {
   echo "[trampoline $(date '+%H:%M:%S')] $*"
+}
+
+# --- Mutual exclusion ---
+
+# Acquire the PID file lock. If another trampoline is running for the same
+# walk directory, kill it first. Handles the race where two trampolines
+# start within milliseconds by re-checking the PID file after a short sleep.
+acquire_lock() {
+  if [ -f "$LOCKFILE" ]; then
+    local old_pid
+    old_pid=$(cat "$LOCKFILE")
+    if kill -0 "$old_pid" 2>/dev/null; then
+      log "Existing trampoline running (PID $old_pid). Killing it..."
+      kill "$old_pid" 2>/dev/null || true
+      # Give it time to clean up its process group
+      sleep 3
+      # Force kill if still alive
+      if kill -0 "$old_pid" 2>/dev/null; then
+        log "Force-killing stale trampoline (PID $old_pid)..."
+        kill -9 "$old_pid" 2>/dev/null || true
+        sleep 1
+      fi
+    else
+      log "Stale PID file (PID $old_pid not running). Removing."
+    fi
+    rm -f "$LOCKFILE"
+  fi
+
+  # Write our PID
+  echo $$ > "$LOCKFILE"
+
+  # Verify we won the race (in case two trampolines start simultaneously)
+  sleep 0.2
+  if [ "$(cat "$LOCKFILE" 2>/dev/null)" != "$$" ]; then
+    echo "Lost PID file race. Another trampoline took over. Exiting." >&2
+    exit 1
+  fi
+
+  log "Acquired lock (PID $$, lockfile $LOCKFILE)"
+}
+
+# Remove the lockfile. Called on all exit paths via trap.
+release_lock() {
+  # Only remove if it's still ours (avoid removing a new trampoline's PID file)
+  if [ -f "$LOCKFILE" ] && [ "$(cat "$LOCKFILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$LOCKFILE"
+  fi
+}
+
+# Kill orphaned claude processes from a crashed/killed trampoline.
+# Targets only claude processes that are children of init (ppid=1) and
+# reference this walk directory — these are definitionally orphans from a
+# dead parent. The interactive claude session (if any) has a real parent.
+kill_orphaned_agents() {
+  local walk_dir_escaped
+  walk_dir_escaped=$(printf '%s' "$WALK_DIR" | sed 's/[[\.*^$()+?{|]/\\&/g')
+  local orphans
+  orphans=$(ps -eo pid,ppid,args | awk -v wd="$walk_dir_escaped" '$2 == 1 && /claude/ && $0 ~ wd && !/awk/ {print $1}')
+  if [ -n "$orphans" ]; then
+    log "Killing orphaned claude processes referencing $WALK_DIR: $orphans"
+    echo "$orphans" | xargs kill -9 2>/dev/null || true
+  fi
 }
 
 # --- Process group management ---
@@ -105,11 +175,12 @@ kill_walk_group() {
 
 # --- Signal handling ---
 
-# On signal: kill the walk process group, then exit.
+# On signal: kill the walk process group and release the lock.
 cleanup() {
   local sig="${1:-EXIT}"
   log "Cleanup triggered (${sig}). Killing walk process group..."
   kill_walk_group
+  release_lock
   # Exit with appropriate code
   case "$sig" in
     INT)  exit 130 ;;
@@ -120,6 +191,7 @@ cleanup() {
 
 trap 'cleanup INT' INT
 trap 'cleanup TERM' TERM
+trap 'release_lock' EXIT
 
 # --- Pristine worktree management ---
 
@@ -260,6 +332,11 @@ advance_good_commit() {
 log "Starting trampoline for: $WALK_DIR"
 log "Walk source: $WALK_REPO_DIR"
 log "Last good commit: $LAST_GOOD_COMMIT"
+
+# Acquire exclusive lock for this walk directory.
+# Kills any existing trampoline and orphaned claude agents.
+acquire_lock
+kill_orphaned_agents
 
 # Set up pristine worktree on startup
 setup_pristine_worktree
