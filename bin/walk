@@ -1188,27 +1188,189 @@ def cmd_memories(args)
   end
 end
 
+# --- Subcommand: propose ---
+
+def cmd_propose(args)
+  text = nil
+  proposed_by = nil
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk propose <key> --text '...' [--proposed-by SLUG] [--walk-dir PATH]"
+    opts.on("--text TEXT", "Proposal text (required)") { |t| text = t }
+    opts.on("--proposed-by SLUG", "Issue proposing this (default: WALK_ISSUE env)") { |s| proposed_by = s }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  key = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+  proposed_by ||= ENV["WALK_ISSUE"]
+
+  unless key
+    $stderr.puts "Error: proposal key required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless text
+    $stderr.puts "Error: --text required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.propose_memory(key, text: text, proposed_by: proposed_by)
+
+  output(result, json: json_output) do |r|
+    puts "Proposed '#{r[:key]}': #{r[:text]}"
+    puts "  Epoch #{r[:epoch]}#{r[:proposed_by] ? ", proposed by #{r[:proposed_by]}" : ""}"
+  end
+end
+
+# --- Subcommand: accept-proposal ---
+
+def cmd_accept_proposal(args)
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk accept-proposal <key> [--walk-dir PATH]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  key = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless key
+    $stderr.puts "Error: proposal key required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.accept_proposal(key)
+  unless result
+    $stderr.puts "Error: proposal '#{key}' not found"
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Accepted proposal '#{r[:key]}' → promoted to memory"
+    puts "  #{r[:text]}"
+  end
+end
+
+# --- Subcommand: discard-proposal ---
+
+def cmd_discard_proposal(args)
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk discard-proposal <key> [--walk-dir PATH]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  key = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless key
+    $stderr.puts "Error: proposal key required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.discard_proposal(key)
+  unless result
+    $stderr.puts "Error: proposal '#{key}' not found"
+    exit 1
+  end
+
+  output({ key: key, discarded: true }, json: json_output) do |_|
+    puts "Discarded proposal '#{key}'"
+  end
+end
+
+# --- Subcommand: proposals ---
+
+def cmd_proposals(args)
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk proposals [--walk-dir PATH]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  walk_dir = walk_dir_flag || resolve_walk_dir(args.shift)
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  proposals = backend.pending_proposals
+
+  output(proposals, json: json_output) do |list|
+    if list.empty?
+      puts "No pending proposals."
+    else
+      puts "Pending memory proposals (#{list.size}):"
+      puts ""
+      list.each do |p|
+        by_note = p[:proposed_by] ? " (by #{p[:proposed_by]})" : ""
+        puts "  #{p[:key]} [E#{p[:epoch]}]#{by_note}"
+        puts "    #{p[:text]}"
+      end
+      puts ""
+      puts "Accept: walk accept-proposal <key>"
+      puts "Discard: walk discard-proposal <key>"
+    end
+  end
+end
+
 SUBCOMMANDS = {
-  "new"         => method(:cmd_new),
-  "run"         => method(:cmd_run),
-  "status"      => method(:cmd_status),
-  "history"     => method(:cmd_history),
-  "summary"     => method(:cmd_summary),
-  "tree"        => method(:cmd_tree),
-  "chain"       => method(:cmd_chain),
-  "table"       => method(:cmd_table),
-  "show"        => method(:cmd_show),
-  "close"       => method(:cmd_close),
-  "comment"     => method(:cmd_comment),
-  "create"      => method(:cmd_create),
-  "list"        => method(:cmd_list),
-  "runs"        => method(:cmd_runs),
-  "resume"      => method(:cmd_resume),
-  "follow"      => method(:cmd_follow),
-  "epochs"      => method(:cmd_epochs),
-  "remember"    => method(:cmd_remember),
-  "forget"      => method(:cmd_forget),
-  "memories"    => method(:cmd_memories)
+  "new"              => method(:cmd_new),
+  "run"              => method(:cmd_run),
+  "status"           => method(:cmd_status),
+  "history"          => method(:cmd_history),
+  "summary"          => method(:cmd_summary),
+  "tree"             => method(:cmd_tree),
+  "chain"            => method(:cmd_chain),
+  "table"            => method(:cmd_table),
+  "show"             => method(:cmd_show),
+  "close"            => method(:cmd_close),
+  "comment"          => method(:cmd_comment),
+  "create"           => method(:cmd_create),
+  "list"             => method(:cmd_list),
+  "runs"             => method(:cmd_runs),
+  "resume"           => method(:cmd_resume),
+  "follow"           => method(:cmd_follow),
+  "epochs"           => method(:cmd_epochs),
+  "remember"         => method(:cmd_remember),
+  "forget"           => method(:cmd_forget),
+  "memories"         => method(:cmd_memories),
+  "propose"          => method(:cmd_propose),
+  "accept-proposal"  => method(:cmd_accept_proposal),
+  "discard-proposal" => method(:cmd_discard_proposal),
+  "proposals"        => method(:cmd_proposals)
 }.freeze
 
 def main
@@ -1245,6 +1407,12 @@ def main
         walk remember <key> --text '...'          Record a memory (artifact, env, constraint)
         walk forget <key>                         Kill a memory (mark as dead)
         walk memories [--all]                     List alive memories (--all includes dead)
+
+      Memory proposals (executor -> planner review):
+        walk propose <key> --text '...'           Propose a memory for planner review
+        walk accept-proposal <key>                Accept proposal (promote to memory)
+        walk discard-proposal <key>               Discard proposal
+        walk proposals                            List pending proposals
 
       All subcommands support --json for structured output.
     HELP

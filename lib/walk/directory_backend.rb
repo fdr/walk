@@ -1018,6 +1018,95 @@ module Walk
 
     public
 
+    # --- Memory proposals (executor -> planner review) ---
+
+    # Propose a memory for planner review.
+    # Proposals are stored as YAML files in memory_proposals/.
+    # Returns the proposal hash.
+    def propose_memory(key, text:, proposed_by: nil)
+      proposals_dir = File.join(@walk_dir, "memory_proposals")
+      FileUtils.mkdir_p(proposals_dir)
+
+      data = {
+        "key" => key,
+        "text" => text,
+        "proposed_by" => proposed_by,
+        "epoch" => [current_epoch, 1].max,
+        "proposed_at" => Time.now.iso8601
+      }
+
+      File.write(File.join(proposals_dir, "#{key}.yaml"), YAML.dump(data))
+
+      symbolize_proposal(data)
+    end
+
+    # Return all pending proposals, optionally filtered by epoch.
+    def pending_proposals(epoch: nil)
+      proposals_dir = File.join(@walk_dir, "memory_proposals")
+      return [] unless Dir.exist?(proposals_dir)
+
+      proposals = Dir.glob(File.join(proposals_dir, "*.yaml")).filter_map do |path|
+        data = YAML.safe_load(File.read(path), permitted_classes: [Time])
+        next unless data.is_a?(Hash)
+        symbolize_proposal(data)
+      rescue Psych::SyntaxError
+        nil
+      end
+
+      proposals = proposals.select { |p| p[:epoch] == epoch } if epoch
+      proposals.sort_by { |p| p[:proposed_at].to_s }
+    end
+
+    # Accept a proposal: promote to a real memory and remove the proposal.
+    # Returns the new memory hash, or nil if proposal not found.
+    def accept_proposal(key)
+      proposals_dir = File.join(@walk_dir, "memory_proposals")
+      path = File.join(proposals_dir, "#{key}.yaml")
+      return nil unless File.exist?(path)
+
+      data = YAML.safe_load(File.read(path), permitted_classes: [Time]) || {}
+      memory = create_memory(key, text: data["text"],
+                             created_by: data["proposed_by"])
+
+      FileUtils.rm_f(path)
+      memory
+    end
+
+    # Discard a proposal (remove without promoting).
+    # Returns true if removed, false if not found.
+    def discard_proposal(key)
+      proposals_dir = File.join(@walk_dir, "memory_proposals")
+      path = File.join(proposals_dir, "#{key}.yaml")
+      return false unless File.exist?(path)
+
+      FileUtils.rm_f(path)
+      true
+    end
+
+    # Auto-cleanup: discard proposals older than max_age epochs.
+    def cleanup_stale_proposals(max_age: 3)
+      epoch = [current_epoch, 1].max
+      cutoff = epoch - max_age
+
+      pending_proposals.each do |p|
+        discard_proposal(p[:key]) if p[:epoch] <= cutoff
+      end
+    end
+
+    private
+
+    def symbolize_proposal(data)
+      {
+        key: data["key"],
+        text: data["text"],
+        proposed_by: data["proposed_by"],
+        epoch: data["epoch"],
+        proposed_at: data["proposed_at"]
+      }
+    end
+
+    public
+
     # --- Temporal epochs (planning rounds) ---
 
     # Get current epoch number (0 if no epochs yet)

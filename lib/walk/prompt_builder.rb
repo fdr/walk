@@ -164,6 +164,37 @@ module Walk
       lines.join("\n")
     end
 
+    # Build a proposals section for the planning prompt.
+    # Shows pending memory proposals from executors for planner review.
+    def build_proposals_section(backend)
+      proposals = backend.pending_proposals
+      return "" if proposals.empty?
+
+      # Auto-cleanup stale proposals (older than 3 epochs)
+      backend.cleanup_stale_proposals(max_age: 3)
+      proposals = backend.pending_proposals
+      return "" if proposals.empty?
+
+      lines = []
+      lines << "## Memory Proposals (from executors)"
+      lines << ""
+      lines << "Executors proposed these memories. Review each one:"
+      lines << "- **Accept** valuable ones: `walk accept-proposal \"key\"` (promotes to memory)"
+      lines << "- **Synthesize**: if multiple proposals cover the same topic, create one"
+      lines << "  consolidated memory with `walk remember` and discard the proposals"
+      lines << "- **Discard** noise: `walk discard-proposal \"key\"`"
+      lines << ""
+      lines << "| Key | Text | By | Epoch |"
+      lines << "|-----|------|----|-------|"
+      proposals.each do |p|
+        by = p[:proposed_by] || ""
+        lines << "| #{p[:key]} | #{p[:text]} | #{by} | E#{p[:epoch]} |"
+      end
+      lines << ""
+
+      lines.join("\n")
+    end
+
     # Build a context pressure section showing expansion ratios and budget.
     # The planner uses this to self-limit how many issues it creates.
     def build_context_pressure_section(exp_stats, budget_bytes, memories_bytes: 0)
@@ -302,6 +333,18 @@ module Walk
         To review accumulated walk changes since last known-good state:
           cd ~/walk && git diff $(cat .last_good_commit)..HEAD
       SELFMOD
+      parts << <<~PROPOSALS.chomp
+        MEMORY PROPOSALS:
+        When you discover a procedure, workaround, or fact that required reading
+        source code or trial-and-error to figure out, propose it as a memory:
+          walk propose "short-key" --text "One-line description of the procedure"
+
+        Good proposals save the next executor from re-deriving the same knowledge.
+        Propose when you:
+        - Had to read multiple files to understand how to do something common
+        - Found a non-obvious prerequisite or setup step
+        - Discovered a useful command pattern not in CLAUDE.md
+      PROPOSALS
       parts.join("\n\n")
     end
 
@@ -417,6 +460,9 @@ module Walk
       memories_section = build_memories_section(backend)
       memories_bytes = backend.alive_memories_bytes
 
+      # Proposals section (executor -> planner review)
+      proposals_section = build_proposals_section(backend)
+
       # Context pressure: expansion stats for sliding window awareness
       # ~120KB budget proxy for 200K token window minus system prompt and safety margin
       context_budget_bytes = 120_000
@@ -453,6 +499,7 @@ module Walk
 
           #{open_context}
           #{memories_section}
+          #{proposals_section}
           #{context_pressure_section}
         S
         exploration_steps: <<~S,
