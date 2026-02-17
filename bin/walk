@@ -375,14 +375,16 @@ def cmd_create(args)
   priority = 2
   body = ""
   blocked_by = []
+  derived_from = []
   json_output = false
   walk_dir_flag = nil
   parser = OptionParser.new do |opts|
-    opts.banner = "Usage: walk create <slug> --title '...' [--type TYPE] [--priority N] [--blocked-by SLUG] --body '...' [--walk-dir PATH]"
+    opts.banner = "Usage: walk create <slug> --title '...' [--type TYPE] [--priority N] [--blocked-by SLUG] [--derived-from SLUG] --body '...' [--walk-dir PATH]"
     opts.on("--title TITLE", "Issue title (required)") { |t| title = t }
     opts.on("--type TYPE", "Issue type (default: task)") { |t| type = t }
     opts.on("--priority N", Integer, "Priority 1-3 (default: 2)") { |p| priority = p }
     opts.on("--blocked-by SLUG", "Blocking issue slug (repeatable)") { |s| blocked_by << s }
+    opts.on("--derived-from SLUG", "Source issue this was derived from (repeatable)") { |s| derived_from << s }
     opts.on("--body TEXT", "Issue body/description") { |b| body = b }
     opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
     opts.on("--json", "Output as JSON") { json_output = true }
@@ -410,7 +412,8 @@ def cmd_create(args)
   backend = Walk::DirectoryBackend.new(walk_dir)
   result = backend.create_issue_by_slug(slug,
     title: title, type: type, priority: priority,
-    body: body, blocked_by: blocked_by.empty? ? nil : blocked_by)
+    body: body, blocked_by: blocked_by.empty? ? nil : blocked_by,
+    derived_from: derived_from.empty? ? nil : derived_from)
   unless result
     exit 1
   end
@@ -728,7 +731,7 @@ def cmd_tree(args)
   when :discovery
     tree = backend.build_discovery_tree(include_closed: include_closed)
     if json_output
-      puts JSON.pretty_generate(tree.slice(:roots, :children, :parent_of).merge(
+      puts JSON.pretty_generate(tree.slice(:roots, :children, :parent_of, :parents_of).merge(
         issues: tree[:issues].transform_values { |i| { slug: i[:slug], title: i[:title], status: i[:status] } }
       ))
     else
@@ -1116,6 +1119,7 @@ def main
         walk close --reason 'reason'          Close current issue
         walk comment 'text'                   Add comment to current issue
         walk create <slug> --title '...'      Create new issue
+              [--derived-from SLUG]                Epistemic provenance (repeatable)
         walk list [--status open|closed]      List issues
         walk runs <slug>                      List runs for an issue
 

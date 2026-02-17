@@ -7,6 +7,7 @@
 # and optional blocked_by/ directory with symlinks to blocking issues.
 
 require "json"
+require "set"
 require "time"
 require "yaml"
 
@@ -144,7 +145,7 @@ module Walk
       nil
     end
 
-    def create_issue_by_slug(slug, title:, type: "task", priority: 2, body: "", blocked_by: nil)
+    def create_issue_by_slug(slug, title:, type: "task", priority: 2, body: "", blocked_by: nil, derived_from: nil)
       with_walk_lock do
         existing = find_issue_dir(slug)
         if existing
@@ -165,6 +166,14 @@ module Walk
           FileUtils.mkdir_p(blocked_by_dir)
           Array(blocked_by).each do |dep_slug|
             File.symlink("../../#{dep_slug}", File.join(blocked_by_dir, dep_slug))
+          end
+        end
+
+        if derived_from
+          derived_from_dir = File.join(issue_dir, "derived_from")
+          FileUtils.mkdir_p(derived_from_dir)
+          Array(derived_from).each do |source_slug|
+            File.symlink("../../#{source_slug}", File.join(derived_from_dir, source_slug))
           end
         end
 
@@ -599,12 +608,14 @@ module Walk
     # --- Tree views ---
 
     # Build discovery tree: parent -> children it spawned.
-    # Returns { roots: [...], children: { slug => [child_slugs] }, issues: { slug => issue } }
+    # Returns { roots: [...], children: { slug => [child_slugs] }, issues: { slug => issue },
+    #           parent_of: { slug => first_parent }, parents_of: { slug => [all_parents] } }
+    # Supports multi-parent DAG via derived_from/ (with backward compat for discovered_by/).
     def build_discovery_tree(include_closed: false)
       issues = {}
-      parent_of = {}  # child_slug => parent_slug
+      parents_of = Hash.new { |h, k| h[k] = [] }  # child_slug => [parent_slugs]
 
-      # Collect all issues and their discovered_by parents
+      # Collect all issues and their derived_from/discovered_by parents
       subdirs = include_closed ? %w[open closed] : %w[open]
       subdirs.each do |subdir|
         dir = File.join(@walk_dir, subdir)
@@ -620,34 +631,44 @@ module Walk
           issue[:status] = subdir
           issues[slug] = issue
 
-          # Check discovered_by for parent
-          discovered_by_dir = File.join(issue_dir, "discovered_by")
-          if Dir.exist?(discovered_by_dir)
-            Dir.children(discovered_by_dir).each do |entry|
-              path = File.join(discovered_by_dir, entry)
+          # Check derived_from/ first, fall back to discovered_by/ (backward compat)
+          provenance_dir = File.join(issue_dir, "derived_from")
+          provenance_dir = File.join(issue_dir, "discovered_by") unless Dir.exist?(provenance_dir)
+
+          if Dir.exist?(provenance_dir)
+            Dir.children(provenance_dir).sort.each do |entry|
+              path = File.join(provenance_dir, entry)
               next unless File.symlink?(path)
-              # entry is the parent slug
-              parent_of[slug] = entry
-              break  # assume single parent for tree structure
+              parents_of[slug] << entry
             end
           end
         end
       end
 
-      # Invert to get children map
+      # Build parent_of (first parent only, for backward compat display)
+      parent_of = {}
+      parents_of.each do |child, parents|
+        parent_of[child] = parents.first if parents.any?
+      end
+
+      # Invert to get children map (each parent gets all children derived from it)
       children = Hash.new { |h, k| h[k] = [] }
-      parent_of.each do |child, parent|
-        children[parent] << child
+      parents_of.each do |child, parents|
+        parents.each do |parent|
+          children[parent] << child unless children[parent].include?(child)
+        end
       end
 
       # Sort children by slug for consistent output
       children.each_value(&:sort!)
 
-      # Find roots (issues with no parent, or parent not in our set)
-      roots = issues.keys.select { |slug| !parent_of[slug] || !issues[parent_of[slug]] }
+      # Find roots (issues with no parents, or all parents not in our set)
+      roots = issues.keys.select { |slug|
+        parents_of[slug].empty? || parents_of[slug].none? { |p| issues[p] }
+      }
       roots.sort!
 
-      { roots: roots, children: children, issues: issues, parent_of: parent_of }
+      { roots: roots, children: children, issues: issues, parent_of: parent_of, parents_of: parents_of }
     end
 
     # Build blocking tree: shows what blocks what.
@@ -693,26 +714,44 @@ module Walk
     end
 
     # Render discovery tree as text.
-    def render_discovery_tree(tree, root: nil, prefix: "", is_last: true, output: [])
+    # Handles multi-parent DAG: each issue appears under its first parent,
+    # with an [also from: ...] annotation if it has additional parents.
+    # current_parent: the slug of the parent we're rendering under (for annotation)
+    def render_discovery_tree(tree, root: nil, prefix: "", is_last: true, output: [], rendered: nil, current_parent: nil)
+      rendered ||= Set.new
       roots = root ? [root] : tree[:roots]
+      parents_of = tree[:parents_of] || {}
 
       roots.each_with_index do |slug, idx|
         issue = tree[:issues][slug]
         next unless issue
 
-        is_last_root = (idx == roots.length - 1)
+        # Skip if already rendered (DAG dedup)
+        if rendered.include?(slug)
+          connector = root ? (is_last ? "└── " : "├── ") : ""
+          output << "#{prefix}#{connector}↱ #{slug} (see above)"
+          next
+        end
+        rendered.add(slug)
+
         connector = root ? (is_last ? "└── " : "├── ") : ""
         status_mark = issue[:status] == "closed" ? "✓" : "○"
         close_reason = issue[:close_reason] ? " — #{issue[:close_reason][0, 40]}" : ""
 
-        output << "#{prefix}#{connector}#{status_mark} #{slug}: #{issue[:title][0, 50]}#{close_reason}"
+        # Multi-parent annotation: show other parents besides the one we're rendered under
+        all_parents = parents_of[slug] || []
+        other_parents = all_parents.select { |p| p != current_parent && tree[:issues][p] }
+        also_from = other_parents.any? ? " [also from: #{other_parents.join(', ')}]" : ""
+
+        output << "#{prefix}#{connector}#{status_mark} #{slug}: #{issue[:title][0, 50]}#{close_reason}#{also_from}"
 
         children = tree[:children][slug] || []
         children.each_with_index do |child_slug, cidx|
           child_is_last = (cidx == children.length - 1)
           child_prefix = prefix + (root ? (is_last ? "    " : "│   ") : "")
           render_discovery_tree(tree, root: child_slug, prefix: child_prefix,
-                                is_last: child_is_last, output: output)
+                                is_last: child_is_last, output: output, rendered: rendered,
+                                current_parent: slug)
         end
       end
 

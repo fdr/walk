@@ -194,7 +194,7 @@ module Walk
           DRIVER PROTOCOL:
           - Work ONLY on this issue. Do NOT expand scope.
           - Document approach and findings as you go using: walk comment "your notes here"
-          - Create sub-issues for follow-up work using: walk create <slug> --title "..." --body "..."
+          - Create sub-issues for follow-up work using: walk create <slug> --title "..." --derived-from <current-issue> --body "..."
           - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
           - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
           - TO CLOSE: walk close --reason "Brief summary of what was accomplished"
@@ -476,7 +476,9 @@ module Walk
         S
         recording_instruction: '"Write findings to result.md in the issue directory"',
         traceability: <<~S,
-          To link issues, create a blocked_by/ directory with symlinks to dependencies.
+          Always use --derived-from to record epistemic provenance:
+          `walk create new-issue --title "..." --derived-from source-issue --body "..."`
+          Use --blocked-by for execution ordering (scheduling dependencies).
         S
         goal_met_action: <<~S,
           If the walk goals have been met, do not create issues. Instead, write
@@ -503,6 +505,7 @@ module Walk
             --title "Investigate something specific" \\
             --type investigate \\
             --priority 2 \\
+            --derived-from source-issue-slug \\
             --body "Description of what to investigate and why.
 
           ## Close with
@@ -510,9 +513,14 @@ module Walk
           What the agent should report when done."
           ```
 
+          Always specify --derived-from to record where this issue came from (epistemic
+          provenance — what you learned that led to this issue). Multiple sources are
+          allowed: `--derived-from foo --derived-from bar`. This is about provenance
+          (what you learned), not scheduling (use --blocked-by for execution ordering).
+
           For issues that depend on another issue completing first:
           ```
-          walk create child-issue --title "..." --blocked-by parent-issue --body "..."
+          walk create child-issue --title "..." --blocked-by parent-issue --derived-from source-issue --body "..."
           ```
         S
         verify_and_exit: <<~S
