@@ -7,6 +7,16 @@
 #   Exit 130/143  = SIGINT/SIGTERM → trampoline exits
 #   Other         = crash → spawn repair agent → if fixed, restart; else git rollback
 #
+# Process group management:
+#   Walk runs in its own process group (via setsid). On restart/signal, the
+#   entire group is killed — preventing orphaned claude agents from interleaving
+#   with new runs.
+#
+# Pristine worktree:
+#   Maintains WALK_REPO_DIR-pristine/ at LAST_GOOD_COMMIT for side-by-side
+#   comparison during repair. The repair agent can diff modified vs pristine
+#   to identify which changes broke walk.
+#
 # Usage:
 #   walk-trampoline <walk-dir> [walk-run-flags...]
 #   walk-trampoline ~/walks/debian13-port
@@ -26,6 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WALK_REPO_DIR="${WALK_REPO_DIR:-$(dirname "$SCRIPT_DIR")}"
 WALK_BIN="${WALK_REPO_DIR}/bin/walk"
 WALK_MAX_REPAIRS="${WALK_MAX_REPAIRS:-3}"
+PRISTINE_DIR="${WALK_REPO_DIR}-pristine"
 
 # --- Argument parsing ---
 
@@ -52,6 +63,7 @@ LAST_GOOD_FILE="${WALK_DIR}/.last_good_commit"
 CONSECUTIVE_FAILURES=0
 RESTART_COUNT=0
 STDERR_FILE="${LOGS_DIR}/trampoline-stderr.log"
+WALK_PID=""
 
 # Initialize LAST_GOOD_COMMIT from file or current HEAD
 if [ -f "$LAST_GOOD_FILE" ]; then
@@ -63,6 +75,78 @@ fi
 
 log() {
   echo "[trampoline $(date '+%H:%M:%S')] $*"
+}
+
+# --- Process group management ---
+
+# Kill the walk process group (walk + all its children: claude agents, SSH, etc.)
+kill_walk_group() {
+  if [ -n "$WALK_PID" ]; then
+    # Kill the entire process group led by WALK_PID.
+    # setsid makes WALK_PID the process group leader, so -WALK_PID targets
+    # all processes in that group.
+    kill -- -"$WALK_PID" 2>/dev/null || true
+    # Wait briefly for processes to exit
+    local waited=0
+    while kill -0 "$WALK_PID" 2>/dev/null && [ "$waited" -lt 10 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    # Force kill if still alive
+    if kill -0 "$WALK_PID" 2>/dev/null; then
+      log "Force-killing walk process group (SIGKILL)..."
+      kill -9 -- -"$WALK_PID" 2>/dev/null || true
+      sleep 1
+    fi
+    wait "$WALK_PID" 2>/dev/null || true
+    WALK_PID=""
+  fi
+}
+
+# --- Signal handling ---
+
+# On signal: kill the walk process group, then exit.
+cleanup() {
+  local sig="${1:-EXIT}"
+  log "Cleanup triggered (${sig}). Killing walk process group..."
+  kill_walk_group
+  # Exit with appropriate code
+  case "$sig" in
+    INT)  exit 130 ;;
+    TERM) exit 143 ;;
+    *)    exit 0 ;;
+  esac
+}
+
+trap 'cleanup INT' INT
+trap 'cleanup TERM' TERM
+
+# --- Pristine worktree management ---
+
+setup_pristine_worktree() {
+  if [ ! -d "$PRISTINE_DIR" ]; then
+    log "Creating pristine worktree at ${PRISTINE_DIR} (commit ${LAST_GOOD_COMMIT})..."
+    (cd "$WALK_REPO_DIR" && git worktree add "$PRISTINE_DIR" "$LAST_GOOD_COMMIT" --detach 2>/dev/null) || {
+      log "Warning: could not create pristine worktree (non-fatal)."
+      return 0
+    }
+  else
+    log "Updating pristine worktree to ${LAST_GOOD_COMMIT}..."
+    (cd "$PRISTINE_DIR" && git checkout "$LAST_GOOD_COMMIT" --force 2>/dev/null) || {
+      log "Warning: could not update pristine worktree (non-fatal)."
+      return 0
+    }
+  fi
+  log "Pristine worktree ready at ${PRISTINE_DIR}"
+}
+
+advance_pristine_worktree() {
+  local new_commit="$1"
+  if [ -d "$PRISTINE_DIR" ]; then
+    (cd "$PRISTINE_DIR" && git checkout "$new_commit" --force 2>/dev/null) || {
+      log "Warning: could not advance pristine worktree (non-fatal)."
+    }
+  fi
 }
 
 # --- Syntax check ---
@@ -80,7 +164,7 @@ syntax_check() {
   return $failed
 }
 
-# --- Repair agent ---
+# --- Repair agent (ditch repair with worktree diff) ---
 
 spawn_repair_agent() {
   local exit_code="$1"
@@ -92,29 +176,45 @@ spawn_repair_agent() {
     crash_log="$(tail -200 "$driver_log")"
   fi
 
-  local recent_diff=""
-  recent_diff="$(cd "$WALK_REPO_DIR" && git diff HEAD~3..HEAD 2>/dev/null || echo '(no recent changes)')"
-
   local stderr_tail=""
   if [ -f "$STDERR_FILE" ]; then
     stderr_tail="$(tail -100 "$STDERR_FILE")"
   fi
 
+  # Compute diff between last-known-good and current state
+  local worktree_diff=""
+  worktree_diff="$(cd "$WALK_REPO_DIR" && git diff "${LAST_GOOD_COMMIT}..HEAD" 2>/dev/null || echo '(no diff available)')"
+
+  # Build the focused ditch repair prompt using worktree comparison
   local repair_prompt
-  repair_prompt="walk just crashed with exit code ${exit_code}. Diagnose and fix.
+  repair_prompt="walk crashed after self-modification (exit code: ${exit_code}).
 
-Error output (stderr):
+Working version (LAST_GOOD_COMMIT ${LAST_GOOD_COMMIT}): ${PRISTINE_DIR}/
+Modified version (broken): ${WALK_REPO_DIR}/
+
+Diff between working version and broken version:
+${worktree_diff}
+
+Stderr (last 100 lines):
 ${stderr_tail}
-
-Recent walk source changes (git diff HEAD~3..HEAD):
-${recent_diff}
 
 Driver log (last 200 lines):
 ${crash_log}
 
-The walk source is in ${WALK_REPO_DIR}. Read the failing code, diagnose, and fix.
-After fixing, run: ruby -c <file> to verify syntax.
-If you cannot fix it, run: git checkout -- . to revert all changes."
+Your job: fix ${WALK_REPO_DIR}/ so that \`ruby -c\` passes on all .rb files
+and walk can start. Compare each changed file against its pristine version
+in ${PRISTINE_DIR}/ to understand what was modified.
+
+Strategy:
+1. Read the diff above to identify which changes are likely causing the crash
+2. For each suspicious change, compare the file in ${WALK_REPO_DIR}/ against ${PRISTINE_DIR}/
+3. Preserve changes that look correct and intentional
+4. Revert changes that look broken (syntax errors, logic bugs, missing requires)
+5. If you cannot determine the fix, revert the broken files to their pristine versions:
+   cp ${PRISTINE_DIR}/path/to/file ${WALK_REPO_DIR}/path/to/file
+
+After fixing, verify every .rb file:
+  for f in ${WALK_REPO_DIR}/lib/walk/*.rb ${WALK_REPO_DIR}/bin/walk; do ruby -c \"\$f\" || exit 1; done"
 
   # Run repair agent
   if claude --print --dangerously-skip-permissions --max-turns 15 \
@@ -152,13 +252,8 @@ advance_good_commit() {
   echo "$new_commit" > "$LAST_GOOD_FILE"
   LAST_GOOD_COMMIT="$new_commit"
   log "Advanced LAST_GOOD_COMMIT to $new_commit"
+  advance_pristine_worktree "$new_commit"
 }
-
-# --- Signal handling ---
-
-TRAPPED_SIGNAL=""
-trap 'TRAPPED_SIGNAL=INT; log "Received SIGINT"' INT
-trap 'TRAPPED_SIGNAL=TERM; log "Received SIGTERM"' TERM
 
 # --- Main loop ---
 
@@ -166,23 +261,26 @@ log "Starting trampoline for: $WALK_DIR"
 log "Walk source: $WALK_REPO_DIR"
 log "Last good commit: $LAST_GOOD_COMMIT"
 
-while true; do
-  if [ -n "$TRAPPED_SIGNAL" ]; then
-    log "Exiting due to SIG${TRAPPED_SIGNAL}."
-    exit 0
-  fi
+# Set up pristine worktree on startup
+setup_pristine_worktree
 
+while true; do
   RESTART_COUNT=$((RESTART_COUNT + 1))
   log "=== Run #${RESTART_COUNT} ==="
 
   # Clear restart marker if present
   rm -f "${WALK_DIR}/_restart_requested"
 
-  # Run walk
+  # Run walk in its own process group (setsid).
+  # This makes WALK_PID the process group leader so we can kill all
+  # descendants (claude agents, SSH sessions, etc.) with kill -- -PID.
   set +e
-  "$WALK_BIN" run "$WALK_DIR" "${WALK_RUN_FLAGS[@]}" 2>"$STDERR_FILE"
+  setsid "$WALK_BIN" run "$WALK_DIR" "${WALK_RUN_FLAGS[@]}" 2>"$STDERR_FILE" &
+  WALK_PID=$!
+  wait "$WALK_PID"
   EXIT_CODE=$?
   set -e
+  WALK_PID=""
 
   case $EXIT_CODE in
     0)
