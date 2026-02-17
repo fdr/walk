@@ -146,6 +146,38 @@ module Walk
       File.read(@claude_md_path)
     end
 
+    # Build a context pressure section showing expansion ratios and budget.
+    # The planner uses this to self-limit how many issues it creates.
+    def build_context_pressure_section(exp_stats, budget_bytes)
+      overall = exp_stats[:overall]
+      return "" if overall[:count] == 0
+
+      by_type = exp_stats[:by_type]
+
+      type_rows = by_type.sort_by { |_, v| -v[:count] }.map do |type, stats|
+        "| %-12s | %5d | %5.1fx | %5.1fx |" % [type, stats[:count], stats[:median_ratio], stats[:p75_ratio]]
+      end
+
+      <<~SECTION
+        ## Context Pressure (sliding window budget)
+
+        Context budget: ~#{format_bytes(budget_bytes)}. Issues you create now will be
+        reviewed next round — their closed size consumes your future review budget.
+
+        **Expansion ratios** (issue body → closed result+comments):
+
+        | Type         | Count | Median |   P75 |
+        |--------------|-------|--------|-------|
+        #{type_rows.join("\n")}
+        | **Overall**  | #{"%5d" % overall[:count]} | #{"%5.1fx" % overall[:median_ratio]} | #{"%5.1fx" % overall[:p75_ratio]} |
+
+        Totals: #{format_bytes(overall[:total_initial])} initial → #{format_bytes(overall[:total_closed])} closed.
+
+        Use the P75 ratio to estimate: a 2K issue body at #{overall[:p75_ratio]}x expansion
+        ≈ #{format_bytes((2000 * overall[:p75_ratio]).to_i)} of review context next round.
+      SECTION
+    end
+
     def build_epilogue(issue, type)
       id = issue[:id] || issue[:slug]
 
@@ -470,6 +502,12 @@ module Walk
         "Current epoch: #{current_epoch}. All epochs: #{all_epochs.join(', ')}."
       end
 
+      # Context pressure: expansion stats for sliding window awareness
+      # ~120KB budget proxy for 200K token window minus system prompt and safety margin
+      context_budget_bytes = 120_000
+      exp_stats = backend.expansion_stats
+      context_pressure_section = build_context_pressure_section(exp_stats, context_budget_bytes)
+
       snippets = {
         preamble: <<~S,
           You are a planning agent for a walk exploration.
@@ -499,6 +537,7 @@ module Walk
           ## Open Issues (still in progress)
 
           #{open_context}
+          #{context_pressure_section}
         S
         exploration_steps: <<~S,
           The table shows what was *attempted* (prior) and how much context each issue
@@ -707,7 +746,17 @@ module Walk
         that itself is a meta-improvement opportunity (e.g., add structured summaries,
         limit output capture, or add a `walk digest` command).
 
-        ## Step 4: Create follow-up issues
+        ## Step 4: Create follow-up issues (sliding window)
+
+        You are operating in a **sliding window** over the problem space. You will get
+        another planning round after this batch completes. Branches you don't pursue
+        now aren't lost — they'll be available next round.
+
+        **Order by criticality**: Create the most informative/generative issues first.
+        After each issue you create, mentally estimate its closed size using the
+        expansion ratios from the Context Pressure section above. Stop creating issues
+        when the estimated next-round review budget would exceed the context window.
+        It's better to create 3 high-criticality issues than 8 mixed ones.
 
         For each generative finding, create 0-2 follow-up issues.
 
