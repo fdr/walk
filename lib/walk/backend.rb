@@ -21,7 +21,8 @@ module Walk
     end
 
     # Closes an issue. Returns a result hash.
-    def close_issue(id, reason:)
+    # signal: "routine" (default), "surprising", or "pivotal"
+    def close_issue(id, reason:, signal: "routine")
       raise NotImplementedError, "#{self.class}#close_issue"
     end
 

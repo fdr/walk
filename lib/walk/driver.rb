@@ -53,6 +53,8 @@ module Walk
       @shutdown_requested = false
       @mutex = Mutex.new
       @backend_mutex = Mutex.new
+      @planning_threshold = 15_000  # bytes; adaptive, clamped to [5KB, 50KB]
+      @last_planning_time = Time.now
       @planning = PlanningLifecycle.new(
         backend: @backend,
         prompt_builder: @prompt_builder,
@@ -172,7 +174,6 @@ module Walk
 
     def run_sequential(once: false, dry_run: false)
       planning_rounds = 0
-      surprising_flag = false
 
       loop do
         check_restart_requested
@@ -186,24 +187,23 @@ module Walk
         @iteration += 1
         log :info, "--- Iteration #{@iteration} ---"
 
+        # Check if accumulated context warrants an early planning round
+        if should_plan_now?
+          issues = @backend.ready_issues(parent: @parent)
+          if !issues.empty?
+            log :info, "Context-triggered planning — running planner before next issue."
+            result = run_planning_round(dry_run: dry_run)
+            return if dry_run
+            return if result == :completed
+            sleep @sleep_interval
+            next
+          end
+        end
+
         issues = @backend.ready_issues(parent: @parent)
         log :info, "Ready issues: #{issues.length}"
 
-        # If a SURPRISING close was detected and there are still ready issues,
-        # force a planning round to re-evaluate before continuing.
-        if surprising_flag && !issues.empty?
-          log :info, "SURPRISING close detected — forcing early planning round before next issue."
-          surprising_flag = false
-          result = spawn_planning_agent(dry_run: dry_run)
-          return if dry_run
-          return if result == :completed
-          sleep @sleep_interval
-          next
-        end
-
         if issues.empty?
-          surprising_flag = false
-
           if parent_closed?
             log :info, "Parent is closed. Exiting."
             finalize_walk("stopped", reason: "parent closed")
@@ -221,7 +221,7 @@ module Walk
 
           log :info, "No ready issues (planning round #{planning_rounds}/#{MAX_PLANNING_ROUNDS}). " \
                       "Spawning planning agent..."
-          result = spawn_planning_agent(dry_run: dry_run)
+          result = run_planning_round(dry_run: dry_run)
           return if dry_run
           return if result == :completed
 
@@ -237,16 +237,6 @@ module Walk
 
         work_issue(issue, dry_run: dry_run)
         return if once || dry_run
-
-        # Check if the just-closed issue had a SURPRISING close reason.
-        # If so, flag it so the next iteration forces an early planning round.
-        if @backend.respond_to?(:show_issue)
-          closed_issue = @backend.show_issue(issue_id)
-          if closed_issue && closed_issue[:close_reason].to_s.start_with?("SURPRISING:")
-            log :info, "Issue #{issue_id} closed with SURPRISING reason: #{closed_issue[:close_reason]}"
-            surprising_flag = true
-          end
-        end
 
         sleep @sleep_interval
       end
@@ -302,7 +292,19 @@ module Walk
           end
         end
 
-        # If no active threads and no ready issues, try planning
+        # Context-triggered planning: if accumulated context warrants it and
+        # no agents are active, run a planning round before picking next issues
+        if active_threads.empty? && should_plan_now?
+          issues = @backend.ready_issues(parent: @parent)
+          if issues.any?
+            log :info, "Context-triggered planning (concurrent) — running planner."
+            result = run_planning_round(dry_run: false)
+            return if result == :completed
+            next
+          end
+        end
+
+        # If no active threads and no ready issues, try planning (drain fallback)
         if active_threads.empty?
           issues = @backend.ready_issues(parent: @parent)
           if issues.empty?
@@ -324,7 +326,7 @@ module Walk
             log :info, "No ready issues and no active agents " \
                         "(planning round #{planning_rounds}/#{MAX_PLANNING_ROUNDS}). " \
                         "Spawning planning agent..."
-            result = spawn_planning_agent(dry_run: false)
+            result = run_planning_round(dry_run: false)
             return if result == :completed
 
             planning_rounds = 0 if result == :created
@@ -486,6 +488,61 @@ module Walk
 
     def finalize_walk(status, reason: nil)
       @planning.finalize_walk(status, reason: reason)
+    end
+
+    # --- Context-triggered planning ---
+
+    PLANNING_THRESHOLD_MIN = 5_000    # bytes
+    PLANNING_THRESHOLD_MAX = 50_000   # bytes
+
+    # Check if accumulated context since last planning warrants an early round.
+    # Returns true if:
+    #   - Any issue closed with "pivotal" signal, OR
+    #   - Cumulative new bytes > threshold AND at least one "surprising" signal
+    def should_plan_now?
+      return false unless @backend.respond_to?(:new_context_since)
+
+      ctx = @backend.new_context_since(@last_planning_time)
+      return false if ctx[:issues].empty?
+
+      if ctx[:signals].include?("pivotal")
+        log :info, "Pivotal signal detected in #{ctx[:issues].join(', ')} — plan now."
+        return true
+      end
+
+      if ctx[:bytes] > @planning_threshold && ctx[:signals].include?("surprising")
+        log :info, "Context threshold exceeded (#{ctx[:bytes]} > #{@planning_threshold}) " \
+                    "with surprising signal — plan now."
+        return true
+      end
+
+      false
+    end
+
+    # Wrapper around spawn_planning_agent that also updates the adaptive threshold
+    # and resets the last_planning_time.
+    def run_planning_round(dry_run: false)
+      pre_planning_open = @backend.ready_issues(parent: @parent).size
+      result = spawn_planning_agent(dry_run: dry_run)
+      return result if dry_run
+
+      @last_planning_time = Time.now
+
+      # Adapt threshold based on planning round value
+      post_planning_open = @backend.ready_issues(parent: @parent).size
+      issues_created = [post_planning_open - pre_planning_open, 0].max
+
+      if issues_created <= 1
+        # Low-value planning round — raise threshold to plan less often
+        @planning_threshold = [(@planning_threshold * 1.5).to_i, PLANNING_THRESHOLD_MAX].min
+        log :info, "Low-value planning (#{issues_created} created) — threshold raised to #{@planning_threshold}"
+      elsif issues_created >= 3
+        # High-value planning round — lower threshold to be more responsive
+        @planning_threshold = [(@planning_threshold * 0.75).to_i, PLANNING_THRESHOLD_MIN].max
+        log :info, "High-value planning (#{issues_created} created) — threshold lowered to #{@planning_threshold}"
+      end
+
+      result
     end
 
     # --- Housekeeping ---

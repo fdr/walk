@@ -33,8 +33,8 @@ module Walk
       show_issue(id)
     end
 
-    def close_issue(id, reason:, status: "closed")
-      close_issue_with_status(id, reason: reason, status: status)
+    def close_issue(id, reason:, status: "closed", signal: "routine")
+      close_issue_with_status(id, reason: reason, status: status, signal: signal)
     end
 
     def add_comment(id, text)
@@ -355,6 +355,48 @@ module Walk
       }
     end
 
+    # Return context accumulated since a given ISO8601 timestamp.
+    # Returns { bytes: total_bytes, signals: [signal_strings], issues: [slugs] }
+    def new_context_since(since_time)
+      closed_dir = File.join(@walk_dir, "closed")
+      return { bytes: 0, signals: [], issues: [] } unless Dir.exist?(closed_dir)
+
+      since = since_time.is_a?(Time) ? since_time : Time.parse(since_time.to_s)
+      total_bytes = 0
+      signals = []
+      slugs = []
+
+      Dir.glob(File.join(closed_dir, "*")).each do |dir|
+        next unless Dir.exist?(dir)
+
+        close_yaml = File.join(dir, "close.yaml")
+        next unless File.exist?(close_yaml)
+
+        close_meta = YAML.safe_load(File.read(close_yaml), permitted_classes: [Time]) || {}
+        closed_at = close_meta["closed_at"]
+        next unless closed_at
+
+        closed_time = Time.parse(closed_at.to_s) rescue next
+        next unless closed_time > since
+
+        slug = File.basename(dir)
+        slugs << slug
+
+        # Sum result bytes
+        result_file = File.join(dir, "result.md")
+        total_bytes += File.size(result_file) if File.exist?(result_file)
+
+        comments_file = File.join(dir, "comments.md")
+        total_bytes += File.size(comments_file) if File.exist?(comments_file)
+
+        # Collect signal
+        signal = close_meta["signal"] || "routine"
+        signals << signal if signal != "routine"
+      end
+
+      { bytes: total_bytes, signals: signals, issues: slugs }
+    end
+
     private
 
     # Acquire an exclusive file lock on a walk-level lockfile.
@@ -473,7 +515,7 @@ module Walk
       result
     end
 
-    def close_issue_with_status(slug, reason:, status: "closed")
+    def close_issue_with_status(slug, reason:, status: "closed", signal: "routine")
       with_walk_lock do
         issue_dir = File.join(@walk_dir, "open", slug)
         unless Dir.exist?(issue_dir)
@@ -495,12 +537,15 @@ module Walk
           epoch = current_epoch
           epoch = 1 if epoch == 0  # First closure is epoch 1
 
-          File.write(File.join(dest, "close.yaml"), YAML.dump(
+          close_data = {
             "status" => status,
             "reason" => reason,
             "closed_at" => Time.now.iso8601,
             "epoch" => epoch
-          ))
+          }
+          close_data["signal"] = signal if signal != "routine"
+
+          File.write(File.join(dest, "close.yaml"), YAML.dump(close_data))
 
           File.write(File.join(dest, "result.md"), "#{reason}\n")
 
@@ -510,7 +555,9 @@ module Walk
           # Record in temporal epoch directory
           record_closure_in_epoch(slug, epoch)
 
-          { slug: slug, status: status, reason: reason, dir: dest, epoch: epoch }
+          result = { slug: slug, status: status, reason: reason, dir: dest, epoch: epoch }
+          result[:signal] = signal if signal != "routine"
+          result
         when "blocked", "deferred"
           File.write(File.join(issue_dir, "close.yaml"), YAML.dump(
             "status" => status,
@@ -570,6 +617,7 @@ module Walk
         issue[:closed_at] = close_meta["closed_at"]
         issue[:close_reason] = close_meta["reason"]
         issue[:close_status] = close_meta["status"] || "closed"
+        issue[:signal] = close_meta["signal"] if close_meta["signal"]
       elsif File.exist?(close_md)
         close_content = File.read(close_md)
         if close_content =~ /\A---\n(.*?\n)---/m

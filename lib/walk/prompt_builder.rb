@@ -208,10 +208,13 @@ module Walk
             Then EXIT immediately. The driver handles the rest.
 
           If your findings were unexpected, contradict prior assumptions, or suggest
-          open issues may be based on stale information, signal this:
-            walk close --reason "SURPRISING: <what changed>. <rest of reason>"
-          The driver checks for this prefix and may trigger an early planning round
-          instead of picking up the next issue. This prevents wasted work on issues
+          open issues may be based on stale information, use `walk close --signal`:
+            walk close --reason "..." --signal surprising  # unexpected finding, planner should know soon
+            walk close --reason "..." --signal pivotal     # landscape changed fundamentally, plan NOW
+          Default signal is `routine` (no flag needed for expected results).
+          The driver tracks signals and accumulated context — `pivotal` triggers an
+          immediate planning round; `surprising` with enough accumulated context
+          triggers planning before the next issue. This prevents wasted work on issues
           based on outdated assumptions.
 
           VERIFY YOUR WALK OPERATIONS (use walk CLI, not just filesystem):
@@ -382,8 +385,9 @@ module Walk
       closed_context = if recent_by_epoch.empty?
         "No closed issues yet."
       else
-        # Build compact table: Epoch | Slug | Prior (what was attempted) | Bytes
+        # Build compact table: Epoch | Slug | Prior (what was attempted) | Signal | Bytes
         total_bytes = recent_by_epoch.values.flatten.sum { |i| i[:result_bytes] || 0 }
+        has_signals = recent_by_epoch.values.flatten.any? { |i| i[:signal] }
         issues_flat = recent_by_epoch.sort.reverse.flat_map do |epoch, issues|
           issues.map do |i|
             parent = parent_of[i[:slug]]
@@ -391,6 +395,7 @@ module Walk
               epoch: epoch,
               slug: parent ? "#{i[:slug]} (from #{parent})" : i[:slug],
               prior: i[:title] || i[:slug],
+              signal: i[:signal],
               bytes: i[:result_bytes] || 0
             }
           end
@@ -404,10 +409,28 @@ module Walk
         header = "#{issues_flat.size} issues, #{format_bytes(total_bytes)} total. " \
                  "Epochs #{recent_by_epoch.keys.min}-#{recent_by_epoch.keys.max}. Total closed: #{total_closed}."
 
-        table_header = "| Epoch | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % ["Slug", "Prior (what was attempted)", "Bytes"]
-        table_sep = "|-------|-%s-|-%s-|-%s-|" % ["-" * slug_w, "-" * prior_w, "-" * bytes_w]
-        table_rows = issues_flat.map do |i|
-          "| %5s | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % [i[:epoch], i[:slug], i[:prior], format_bytes(i[:bytes])]
+        if has_signals
+          signal_w = 10
+          table_header = "| Epoch | %-#{slug_w}s | %-#{prior_w}s | %-#{signal_w}s | %#{bytes_w}s |" % ["Slug", "Prior (what was attempted)", "Signal", "Bytes"]
+          table_sep = "|-------|-%s-|-%s-|-%s-|-%s-|" % ["-" * slug_w, "-" * prior_w, "-" * signal_w, "-" * bytes_w]
+          table_rows = issues_flat.map do |i|
+            sig = i[:signal] || ""
+            "| %5s | %-#{slug_w}s | %-#{prior_w}s | %-#{signal_w}s | %#{bytes_w}s |" % [i[:epoch], i[:slug], i[:prior], sig, format_bytes(i[:bytes])]
+          end
+        else
+          table_header = "| Epoch | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % ["Slug", "Prior (what was attempted)", "Bytes"]
+          table_sep = "|-------|-%s-|-%s-|-%s-|" % ["-" * slug_w, "-" * prior_w, "-" * bytes_w]
+          table_rows = issues_flat.map do |i|
+            "| %5s | %-#{slug_w}s | %-#{prior_w}s | %#{bytes_w}s |" % [i[:epoch], i[:slug], i[:prior], format_bytes(i[:bytes])]
+          end
+        end
+
+        signal_note = if has_signals
+          surprising_slugs = issues_flat.select { |i| i[:signal] }.map { |i| i[:slug] }
+          "\nIssues with signals (surprising/pivotal) triggered this planning round — " \
+          "prioritize reviewing these: #{surprising_slugs.join(', ')}\n"
+        else
+          ""
         end
 
         <<~TABLE
@@ -416,7 +439,7 @@ module Walk
           #{table_header}
           #{table_sep}
           #{table_rows.join("\n")}
-
+          #{signal_note}
           Use `walk show <slug>` to load full content (body, comments, result).
         TABLE
       end

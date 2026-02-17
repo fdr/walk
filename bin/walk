@@ -282,13 +282,15 @@ end
 def cmd_close(args)
   reason = nil
   close_status = "closed"
+  signal = "routine"
   json_output = false
   walk_dir_flag = nil
   slug_flag = nil
   parser = OptionParser.new do |opts|
-    opts.banner = "Usage: walk close [--status STATUS] --reason 'reason' [--walk-dir PATH] [--slug SLUG]"
+    opts.banner = "Usage: walk close [--status STATUS] --reason 'reason' [--signal SIGNAL] [--walk-dir PATH] [--slug SLUG]"
     opts.on("--reason REASON", "Close reason (required)") { |r| reason = r }
     opts.on("--status STATUS", "Status: closed, blocked, deferred (default: closed)") { |s| close_status = s }
+    opts.on("--signal SIGNAL", "Signal: routine, surprising, pivotal (default: routine)") { |s| signal = s }
     opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
     opts.on("--slug SLUG", "Issue slug (overrides WALK_ISSUE env)") { |s| slug_flag = s }
     opts.on("--json", "Output as JSON") { json_output = true }
@@ -301,6 +303,15 @@ def cmd_close(args)
   slug = slug_flag || ENV["WALK_ISSUE"]
   walk_dir = walk_dir_flag || resolve_walk_dir(nil)
 
+  # Infer signal from SURPRISING: prefix in reason (backward compat)
+  if reason&.start_with?("SURPRISING:")
+    signal = "surprising" if signal == "routine"
+  end
+
+  unless %w[routine surprising pivotal].include?(signal)
+    $stderr.puts "Error: --signal must be one of: routine, surprising, pivotal"
+    exit 1
+  end
   unless reason
     $stderr.puts "Error: --reason is required"
     $stderr.puts parser.help
@@ -316,13 +327,14 @@ def cmd_close(args)
   end
 
   backend = Walk::DirectoryBackend.new(walk_dir)
-  result = backend.close_issue(slug, reason: reason, status: close_status)
+  result = backend.close_issue(slug, reason: reason, status: close_status, signal: signal)
   unless result
     exit 1
   end
 
   output(result, json: json_output) do |r|
-    puts "Closed #{r[:slug]} (#{r[:status]}): #{r[:reason]}"
+    signal_note = r[:signal] && r[:signal] != "routine" ? " [#{r[:signal]}]" : ""
+    puts "Closed #{r[:slug]} (#{r[:status]})#{signal_note}: #{r[:reason]}"
   end
 end
 
@@ -1155,6 +1167,7 @@ def main
       Agent-facing (WALK_DIR/WALK_ISSUE env vars, or --walk-dir/--slug flags):
         walk show <slug>                      Show issue (body, comments, result)
         walk close --reason 'reason'          Close current issue
+              [--signal SIGNAL]                  Signal: routine, surprising, pivotal
         walk comment 'text'                   Add comment to current issue
         walk create <slug> --title '...'      Create new issue
               [--derived-from SLUG]                Epistemic provenance (repeatable)
