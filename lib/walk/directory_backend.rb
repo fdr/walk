@@ -925,6 +925,101 @@ module Walk
       output
     end
 
+    # --- Memories (bounded epoch memory) ---
+
+    # Create or overwrite a memory. Keys are unique — creating with an existing
+    # key overwrites the old memory.
+    #
+    # Returns the memory hash.
+    def create_memory(key, text:, alive_from: nil, created_by: nil)
+      alive_from ||= [current_epoch, 1].max
+
+      memories_dir = File.join(@walk_dir, "memories")
+      FileUtils.mkdir_p(memories_dir)
+
+      data = {
+        "key" => key,
+        "text" => text,
+        "alive_from" => alive_from,
+        "alive_until" => nil,
+        "created_by" => created_by
+      }
+
+      File.write(File.join(memories_dir, "#{key}.yaml"), YAML.dump(data))
+
+      symbolize_memory(data)
+    end
+
+    # Kill (expire) a memory by setting alive_until.
+    #
+    # Returns the updated memory hash, or nil if key not found.
+    def kill_memory(key, alive_until: nil, killed_by: nil)
+      memories_dir = File.join(@walk_dir, "memories")
+      path = File.join(memories_dir, "#{key}.yaml")
+      return nil unless File.exist?(path)
+
+      alive_until ||= [current_epoch, 1].max
+
+      data = YAML.safe_load(File.read(path)) || {}
+      data["alive_until"] = alive_until
+      data["killed_by"] = killed_by if killed_by
+
+      File.write(path, YAML.dump(data))
+
+      symbolize_memory(data)
+    end
+
+    # Return all alive memories at the given epoch.
+    def alive_memories(epoch: nil)
+      epoch ||= [current_epoch, 1].max
+      all_memories.select { |m| m[:alive_until].nil? || m[:alive_until] > epoch }
+                  .select { |m| m[:alive_from] <= epoch }
+    end
+
+    # Return all memories (including dead ones).
+    def all_memories
+      memories_dir = File.join(@walk_dir, "memories")
+      return [] unless Dir.exist?(memories_dir)
+
+      Dir.glob(File.join(memories_dir, "*.yaml")).filter_map do |path|
+        data = YAML.safe_load(File.read(path))
+        next unless data.is_a?(Hash)
+        symbolize_memory(data)
+      rescue Psych::SyntaxError
+        nil
+      end.sort_by { |m| m[:alive_from] }
+    end
+
+    # Return memories killed within the last N epochs.
+    def recently_dead_memories(epoch: nil, window: 2)
+      epoch ||= [current_epoch, 1].max
+      cutoff = epoch - window
+
+      all_memories.select { |m|
+        m[:alive_until] && m[:alive_until] >= cutoff && m[:alive_until] <= epoch
+      }
+    end
+
+    # Total byte count of all alive memories (for context pressure accounting).
+    def alive_memories_bytes(epoch: nil)
+      alive_memories(epoch: epoch).sum { |m| (m[:text] || "").bytesize + (m[:key] || "").bytesize }
+    end
+
+    private
+
+    def symbolize_memory(data)
+      {
+        key: data["key"],
+        text: data["text"],
+        alive_from: data["alive_from"],
+        alive_until: data["alive_until"],
+        created_by: data["created_by"],
+        killed_by: data["killed_by"]
+      }
+    end
+
+    public
+
     # --- Temporal epochs (planning rounds) ---
 
     # Get current epoch number (0 if no epochs yet)

@@ -146,9 +146,58 @@ module Walk
       File.read(@claude_md_path)
     end
 
+    # Build a memories section for the planning prompt.
+    # Shows alive memories + recently dead ones.
+    def build_memories_section(backend)
+      epoch = [backend.current_epoch, 1].max
+      alive = backend.alive_memories(epoch: epoch)
+      recently_dead = backend.recently_dead_memories(epoch: epoch, window: 2)
+      return "" if alive.empty? && recently_dead.empty?
+
+      lines = []
+      lines << "## Memories (epoch #{epoch})"
+      lines << ""
+
+      if alive.any?
+        lines << "| Key | Text | Alive | By |"
+        lines << "|-----|------|-------|----|"
+        alive.each do |m|
+          by = m[:created_by] || ""
+          lines << "| #{m[:key]} | #{m[:text]} | E#{m[:alive_from]}→ | #{by} |"
+        end
+        lines << ""
+      end
+
+      if recently_dead.any?
+        dead_strs = recently_dead.map { |m|
+          "~~#{m[:key]}~~ (E#{m[:alive_from]}→E#{m[:alive_until]}#{m[:killed_by] ? ", killed by #{m[:killed_by]}" : ""})"
+        }
+        lines << "Recently dead: #{dead_strs.join(', ')}"
+        lines << ""
+      end
+
+      # Byte count for context pressure awareness
+      total_bytes = alive.sum { |m| (m[:text] || "").bytesize + (m[:key] || "").bytesize }
+      if total_bytes > 0
+        lines << "_Memories: #{total_bytes} bytes of context._"
+        lines << ""
+      end
+
+      lines << <<~GUIDANCE.chomp
+        Memories are short descriptions with epoch bounds. Executors record them with
+        `walk remember`. Common patterns include artifact locations, environment state,
+        evaluation objectives, and constraints — but any memory that saves re-discovery
+        or directs evaluation is useful. Propagate relevant memories into issue bodies.
+        When a memory becomes stale, the executor should `walk forget` it.
+      GUIDANCE
+      lines << ""
+
+      lines.join("\n")
+    end
+
     # Build a context pressure section showing expansion ratios and budget.
     # The planner uses this to self-limit how many issues it creates.
-    def build_context_pressure_section(exp_stats, budget_bytes)
+    def build_context_pressure_section(exp_stats, budget_bytes, memories_bytes: 0)
       overall = exp_stats[:overall]
       return "" if overall[:count] == 0
 
@@ -172,7 +221,7 @@ module Walk
         | **Overall**  | #{"%5d" % overall[:count]} | #{"%5.1fx" % overall[:median_ratio]} | #{"%5.1fx" % overall[:p75_ratio]} |
 
         Totals: #{format_bytes(overall[:total_initial])} initial → #{format_bytes(overall[:total_closed])} closed.
-
+        #{"Memories: #{format_bytes(memories_bytes)} (counted toward budget).\n" if memories_bytes > 0}
         Use the P75 ratio to estimate: a 2K issue body at #{overall[:p75_ratio]}x expansion
         ≈ #{format_bytes((2000 * overall[:p75_ratio]).to_i)} of review context next round.
       SECTION
@@ -502,11 +551,15 @@ module Walk
         "Current epoch: #{current_epoch}. All epochs: #{all_epochs.join(', ')}."
       end
 
+      # Memories section
+      memories_section = build_memories_section(backend)
+      memories_bytes = backend.alive_memories_bytes
+
       # Context pressure: expansion stats for sliding window awareness
       # ~120KB budget proxy for 200K token window minus system prompt and safety margin
       context_budget_bytes = 120_000
       exp_stats = backend.expansion_stats
-      context_pressure_section = build_context_pressure_section(exp_stats, context_budget_bytes)
+      context_pressure_section = build_context_pressure_section(exp_stats, context_budget_bytes, memories_bytes: memories_bytes)
 
       snippets = {
         preamble: <<~S,
@@ -537,6 +590,7 @@ module Walk
           ## Open Issues (still in progress)
 
           #{open_context}
+          #{memories_section}
           #{context_pressure_section}
         S
         exploration_steps: <<~S,
@@ -723,6 +777,10 @@ module Walk
         - Were logs too large for effective review? → Consider adding summary
           extraction or size-limited output to the reporting or agent_runner.
 
+        Review alive memories. Are any stale? Should new ones be created based on
+        recent results? Are there evaluation objectives that should be assessed this
+        round? Create a meta issue if a memory-related improvement is needed.
+
         Walk architecture (for context — read source before modifying):
         - `bin/walk` — CLI entrypoint, ~1100 lines. All subcommands defined here.
         - `lib/walk/driver.rb` — Core loop: pick issues, spawn agents, plan.
@@ -759,6 +817,11 @@ module Walk
         It's better to create 3 high-criticality issues than 8 mixed ones.
 
         For each generative finding, create 0-2 follow-up issues.
+
+        Check Alive Memories for information the executor will need. Include relevant
+        memories directly in the issue body — do not force re-discovery of known state.
+        When an issue's result invalidates a memory, instruct the executor to
+        `walk forget` the old one and `walk remember` the new state.
 
         ### The issue body IS the prompt
 

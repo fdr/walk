@@ -1062,6 +1062,134 @@ def cmd_epochs(args)
   end
 end
 
+# --- Subcommand: remember ---
+
+def cmd_remember(args)
+  text = nil
+  created_by = nil
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk remember <key> --text '...' [--created-by SLUG] [--walk-dir PATH]"
+    opts.on("--text TEXT", "Memory text (required)") { |t| text = t }
+    opts.on("--created-by SLUG", "Issue that created this memory (default: WALK_ISSUE env)") { |s| created_by = s }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  key = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+  created_by ||= ENV["WALK_ISSUE"]
+
+  unless key
+    $stderr.puts "Error: memory key required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless text
+    $stderr.puts "Error: --text required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.create_memory(key, text: text, created_by: created_by)
+
+  output(result, json: json_output) do |r|
+    puts "Remembered '#{r[:key]}': #{r[:text]}"
+    puts "  Alive from epoch #{r[:alive_from]}#{r[:created_by] ? ", created by #{r[:created_by]}" : ""}"
+  end
+end
+
+# --- Subcommand: forget ---
+
+def cmd_forget(args)
+  killed_by = nil
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk forget <key> [--killed-by SLUG] [--walk-dir PATH]"
+    opts.on("--killed-by SLUG", "Issue that killed this memory (default: WALK_ISSUE env)") { |s| killed_by = s }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  key = args.shift
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+  killed_by ||= ENV["WALK_ISSUE"]
+
+  unless key
+    $stderr.puts "Error: memory key required"
+    $stderr.puts parser.help
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  result = backend.kill_memory(key, killed_by: killed_by)
+  unless result
+    $stderr.puts "Error: memory '#{key}' not found"
+    exit 1
+  end
+
+  output(result, json: json_output) do |r|
+    puts "Forgot '#{r[:key]}' (alive E#{r[:alive_from]}→E#{r[:alive_until]})"
+    puts "  Killed by: #{r[:killed_by]}" if r[:killed_by]
+  end
+end
+
+# --- Subcommand: memories ---
+
+def cmd_memories(args)
+  show_all = false
+  json_output = false
+  walk_dir_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk memories [--all] [--walk-dir PATH]"
+    opts.on("--all", "Show all memories including dead ones") { show_all = true }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  walk_dir = walk_dir_flag || resolve_walk_dir(args.shift)
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  memories = show_all ? backend.all_memories : backend.alive_memories
+
+  output(memories, json: json_output) do |list|
+    if list.empty?
+      puts show_all ? "No memories recorded." : "No alive memories."
+    else
+      label = show_all ? "All memories" : "Alive memories (epoch #{[backend.current_epoch, 1].max})"
+      puts "#{label}:"
+      puts ""
+      list.each do |m|
+        alive_range = "E#{m[:alive_from]}→"
+        alive_range += m[:alive_until] ? "E#{m[:alive_until]}" : ""
+        dead_mark = m[:alive_until] ? " [DEAD]" : ""
+        by_note = m[:created_by] ? " (by #{m[:created_by]})" : ""
+        killed_note = m[:killed_by] ? " (killed by #{m[:killed_by]})" : ""
+        puts "  #{m[:key]} (#{alive_range})#{dead_mark}#{by_note}#{killed_note}"
+        puts "    #{m[:text]}"
+      end
+    end
+  end
+end
+
 # --- Subcommand: self-modify ---
 
 def cmd_self_modify(args)
@@ -1141,6 +1269,9 @@ SUBCOMMANDS = {
   "resume"      => method(:cmd_resume),
   "follow"      => method(:cmd_follow),
   "epochs"      => method(:cmd_epochs),
+  "remember"    => method(:cmd_remember),
+  "forget"      => method(:cmd_forget),
+  "memories"    => method(:cmd_memories),
   "self-modify" => method(:cmd_self_modify)
 }.freeze
 
@@ -1173,6 +1304,11 @@ def main
               [--derived-from SLUG]                Epistemic provenance (repeatable)
         walk list [--status open|closed]      List issues
         walk runs <slug>                      List runs for an issue
+
+      Memories (bounded epoch memory):
+        walk remember <key> --text '...'          Record a memory (artifact, env, constraint)
+        walk forget <key>                         Kill a memory (mark as dead)
+        walk memories [--all]                     List alive memories (--all includes dead)
 
       Self-modification (for walk meta-improvement):
         walk self-modify --reason '...'           Commit walk changes, request restart
