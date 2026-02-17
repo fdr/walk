@@ -33,8 +33,7 @@ class WalkDriverLoopTest < Minitest::Test
 
     @backend = Walk::DirectoryBackend.new(@tmpdir)
     @prompt_builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :result_md
+      project_dir: @tmpdir
     )
   end
 

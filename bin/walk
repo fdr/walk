@@ -153,7 +153,6 @@ def cmd_run(args)
   effective_claude_md = claude_md ||
     walk_config[:claude_md_path] ||
     (File.exist?(File.join(walk_dir, "CLAUDE.md")) ? File.join(walk_dir, "CLAUDE.md") : nil)
-  effective_close_protocol = walk_config.fetch(:close_protocol, :result_md)
   effective_spawn_mode = walk_config.fetch(:spawn_mode, :stream)
   effective_max_turns = walk_config.fetch(:max_turns, 10)
   effective_sleep_interval = walk_config.fetch(:sleep_interval, 5)
@@ -164,8 +163,7 @@ def cmd_run(args)
   prompt_builder = Walk::PromptBuilder.new(
     project_dir: walk_dir,
     claude_md_path: effective_claude_md,
-    preamble: effective_preamble,
-    close_protocol: effective_close_protocol
+    preamble: effective_preamble
   )
 
   # Default logs_dir to walk_dir/logs/ for stream mode output capture

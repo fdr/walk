@@ -11,10 +11,8 @@ require "set"
 require "time"
 require "yaml"
 
-require_relative "backend"
-
 module Walk
-  class DirectoryBackend < Backend
+  class DirectoryBackend
     attr_reader :walk_dir
 
     def initialize(walk_dir)
@@ -575,14 +573,14 @@ module Walk
 
     # Convert string-keyed config hash to symbols, filtering to known keys.
     def symbolize_config(hash)
-      known_keys = %w[max_turns spawn_mode sleep_interval model claude_md_path close_protocol preamble max_concurrent]
+      known_keys = %w[max_turns spawn_mode sleep_interval model claude_md_path preamble max_concurrent]
       result = {}
       hash.each do |k, v|
         next unless known_keys.include?(k.to_s)
 
         key = k.to_sym
         result[key] = case key
-                      when :spawn_mode, :close_protocol then v.to_s.to_sym
+                      when :spawn_mode then v.to_s.to_sym
                       when :max_turns, :sleep_interval, :max_concurrent then v.to_i
                       else v.to_s
                       end

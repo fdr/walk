@@ -1,9 +1,6 @@
 # frozen_string_literal: true
 
 # lib/walk/driver.rb — Walk driver: pick ready issues, spawn agents, plan.
-#
-# Backend-agnostic driver loop. Both the beads-backed walk-runner.rb and
-# the directory-backed bin/walk use this class.
 
 require "json"
 require "fileutils"
@@ -11,7 +8,6 @@ require "open3"
 require "logger"
 require "set"
 
-require_relative "backend"
 require_relative "prompt_builder"
 require_relative "retry_policy"
 require_relative "planning_lifecycle"
@@ -23,9 +19,8 @@ module Walk
     EXIT_CODE_RESTART = 42
 
     # Options:
-    #   backend:        a Walk::Backend instance
+    #   backend:        a Walk::DirectoryBackend instance
     #   prompt_builder: a Walk::PromptBuilder instance
-    #   parent:         optional parent epic ID (for beads backend)
     #   logs_dir:       directory for prompt/output/digest logs
     #   pid_file:       path to PID file (nil to skip)
     #   logger:         a Logger instance (nil to create default)

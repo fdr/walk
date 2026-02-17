@@ -2,11 +2,8 @@
 
 # test_walk_backend.rb — Contract tests for walk backends.
 #
-# Verifies both DirectoryBackend and BeadsBackend return correct shapes
-# from the 7 Backend interface methods.
-#
-# - DirectoryBackend: tested with tmpdir (unit test, always runnable)
-# - BeadsBackend: tested with bd CLI (integration test, skip when bd unavailable)
+# Verifies DirectoryBackend returns correct shapes from the Backend
+# interface methods.
 #
 # Usage:
 #   ruby test/test_walk_backend.rb
@@ -19,9 +16,8 @@ require "json"
 require "open3"
 
 require_relative "../lib/walk/directory_backend"
-require_relative "../lib/walk/beads_backend"
 
-# Shared contract assertions for any Walk::Backend subclass.
+# Shared contract assertions for Walk::DirectoryBackend.
 module BackendContractTests
   # --- ready_issues ---
 
@@ -283,95 +279,3 @@ class DirectoryBackendContractTest < Minitest::Test
   end
 end
 
-# --- BeadsBackend contract tests (sandbox temp database) ---
-#
-# Creates a temporary bd database in a tmpdir so write operations
-# (create_issue, close_issue, add_comment) are tested without
-# mutating the real project database.
-
-class BeadsBackendContractTest < Minitest::Test
-  include BackendContractTests
-  include LifecycleContractTests
-
-  def setup
-    _out, status = Open3.capture2("bd", "version")
-    skip "bd CLI not available" unless status.success?
-
-    # Create a temp directory with a fresh bd database
-    @tmpdir = Dir.mktmpdir("bd-contract-")
-    @walk_dir = File.join(@tmpdir, "walk-output")
-    FileUtils.mkdir_p(@walk_dir)
-    system("git", "init", @tmpdir, out: File::NULL, err: File::NULL)
-    system("bd", "init", "--prefix", "ct", "--quiet",
-           "--skip-hooks", "--skip-merge-driver",
-           chdir: @tmpdir)
-    @db_path = File.join(@tmpdir, ".beads", "beads.db")
-
-    # Create a parent epic for lifecycle tests
-    output, _status = Open3.capture2(
-      "bd", "--db", @db_path, "create", "Contract test epic",
-      "-p", "1", "--description", "Epic for lifecycle contract tests."
-    )
-    @parent_id = output[/^. Created issue: (\S+)/, 1]
-
-    @backend = Walk::BeadsBackend.new(db: @db_path, parent: @parent_id,
-                                      walk_dir: @walk_dir)
-
-    # Seed a known issue as child of the epic
-    output, _status = Open3.capture2(
-      "bd", "--db", @db_path, "create", "Seed issue",
-      "-p", "2", "--parent", @parent_id,
-      "--description", "Seeded in setup for contract tests."
-    )
-    @known_issue_id = output[/^. Created issue: (\S+)/, 1]
-    @closable_issue_id = nil
-  end
-
-  def teardown
-    FileUtils.rm_rf(@tmpdir) if @tmpdir
-  end
-
-  private
-
-  def seed_issue
-    return if @known_issue_id
-
-    output, _status = Open3.capture2(
-      "bd", "--db", @db_path, "create", "Contract test issue",
-      "-p", "2", "--parent", @parent_id,
-      "--description", "Body for contract testing."
-    )
-    @known_issue_id = output[/^. Created issue: (\S+)/, 1]
-  end
-
-  def seed_closable_issue
-    return if @closable_issue_id
-
-    output, _status = Open3.capture2(
-      "bd", "--db", @db_path, "create", "Closable issue",
-      "-p", "2", "--parent", @parent_id,
-      "--description", "Will be closed by contract test."
-    )
-    @closable_issue_id = output[/^. Created issue: (\S+)/, 1]
-  end
-
-  def seed_lifecycle
-    seed_issue
-  end
-
-  def seed_lifecycle_with_closed_issue
-    seed_lifecycle
-    return if @_closed_lifecycle_seeded
-
-    output, _status = Open3.capture2(
-      "bd", "--db", @db_path, "create", "Closed lifecycle issue",
-      "-p", "2", "--parent", @parent_id,
-      "--description", "Will be closed for lifecycle testing."
-    )
-    closed_id = output[/^. Created issue: (\S+)/, 1]
-    system("bd", "--db", @db_path, "close", closed_id,
-           "--reason", "lifecycle test",
-           out: File::NULL, err: File::NULL)
-    @_closed_lifecycle_seeded = true
-  end
-end

@@ -1,10 +1,6 @@
 # frozen_string_literal: true
 
 # lib/walk/prompt_builder.rb — Builds agent and planning prompts for walk drivers.
-#
-# Backend-agnostic: all issue/context fetching is done through the Backend
-# interface. Both the beads-backed walk-runner.rb and the directory-backed
-# bin/walk use this class.
 
 module Walk
   class PromptBuilder
@@ -12,12 +8,10 @@ module Walk
     #   project_dir:    working directory included in preamble
     #   claude_md_path: path to CLAUDE.md (nil to skip)
     #   preamble:       custom preamble text (overrides default)
-    #   close_protocol: :bd (use bd CLI) or :result_md (write result.md)
-    def initialize(project_dir:, claude_md_path: nil, preamble: nil, close_protocol: :bd)
+    def initialize(project_dir:, claude_md_path: nil, preamble: nil, **_ignored)
       @project_dir = project_dir
       @claude_md_path = claude_md_path
       @preamble = preamble
-      @close_protocol = close_protocol
     end
 
     # Extract issue type prefix from title or slug for logging.
@@ -42,7 +36,7 @@ module Walk
 
     # Build the full agent prompt for working on a single issue.
     #
-    # backend: a Walk::Backend used to load parent context
+    # backend: a Walk::DirectoryBackend used to load parent context
     def build_prompt(issue, backend:)
       parent_context = backend.load_parent_context(issue)
       claude_md = load_claude_md
@@ -88,17 +82,9 @@ module Walk
     end
 
     # Build the planning prompt for creating new issues when all are closed.
-    #
-    # For :bd close_protocol, epic_id and epic_output are used.
-    # For :result_md close_protocol, backend and walk_dir are used.
     def build_planning_prompt(backend:, epic_id: nil, epic_output: nil)
       claude_md = load_claude_md
-
-      if @close_protocol == :bd
-        build_bd_planning_prompt(claude_md, epic_id, epic_output)
-      else
-        build_directory_planning_prompt(claude_md, backend)
-      end
+      build_directory_planning_prompt(claude_md, backend)
     end
 
     private
@@ -211,46 +197,11 @@ module Walk
     end
 
     def build_epilogue(issue, type)
-      id = issue[:id] || issue[:slug]
-
-      if @close_protocol == :bd
-        snippets = build_bd_epilogue_snippets(id)
-      else
-        snippets = build_result_md_epilogue_snippets(issue)
-      end
+      snippets = build_epilogue_snippets(issue)
       build_shared_epilogue(snippets)
     end
 
-    # Backend-specific snippets for bd (beads) protocol.
-    def build_bd_epilogue_snippets(id)
-      {
-        driver_protocol: <<~S.chomp,
-          DRIVER PROTOCOL:
-          - Work ONLY on issue #{id}.
-          - Read issue first: bd show #{id}
-          - Document approach: bd comments add #{id} "Chose <approach> because <why>"
-          - Document findings as you go: bd comments add #{id} "<what-you-learned>"
-          - Create sub-issues for follow-up work: bd create "Prefix: title" --parent #{id} --deps "discovered-from:#{id}" --description="..."
-            (The --deps flag links back to THIS issue for context. Always include it so readers know where the task came from.)
-          - Close with concrete results: data, traces, measurements, or verified code
-          - Close with rationale: bd close #{id} --reason "<specific-finding-or-result>"
-          - EXIT immediately after closing. The driver restarts you with fresh context.
-        S
-        live_comment_watching: <<~S.chomp,
-          LIVE COMMENT WATCHING (for user feedback during execution):
-          - Periodically check for new comments (every few major steps) with:
-            bd activity --mol #{id} --type comment --since 5m
-          - If you see NEW comments (timestamps after your agent started at #{Time.now.strftime('%H:%M')}),
-            fetch full content with: bd comments #{id}
-          - Incorporate any user feedback or direction into your work
-          - This lets the user communicate with you while you work
-        S
-        git_branch_doc: "Document the branch name in your bd comments so the next agent can find it"
-      }
-    end
-
-    # Backend-specific snippets for directory (result.md) protocol.
-    def build_result_md_epilogue_snippets(issue)
+    def build_epilogue_snippets(issue)
       dir = issue[:dir] || "(issue directory)"
       {
         driver_protocol: <<~S.chomp,
@@ -298,8 +249,8 @@ module Walk
       }
     end
 
-    # Shared epilogue structure used by both backends.
-    # Accepts a hash of backend-specific snippets:
+    # Epilogue structure appended to every agent prompt.
+    # Accepts a hash of snippets:
     #   :driver_protocol        - scope, progress docs, close commands
     #   :live_comment_watching  - how to check for user feedback during execution
     #   :git_branch_doc         - how to document git branch name
@@ -352,82 +303,6 @@ module Walk
           cd ~/walk && git diff $(cat .last_good_commit)..HEAD
       SELFMOD
       parts.join("\n\n")
-    end
-
-    def build_bd_planning_prompt(claude_md, epic_id, epic_output)
-      snippets = {
-        preamble: <<~S,
-          #{preamble_text}
-
-          ---
-
-          #{claude_md}
-
-          ---
-
-          ALL ISSUES UNDER THIS EPIC HAVE BEEN CLOSED.
-
-          ## Current Epic
-
-          #{epic_output}
-        S
-        exploration_steps: <<~S,
-          Do ALL of these before creating any issues:
-          1. List closed issues: bd list --status closed --parent #{epic_id}
-          2. Read conclusions of the 3-5 most recent closed issues: bd comments <id>
-          3. Check for result files: ls results/ and read any relevant ones
-          4. Check git state of repos that were modified: git log --oneline -5 in relevant repos
-          5. Read any source files that recent issues referenced as changed
-
-          CLAUDE.md is already in your context above. For bd CLI, use: bd create, bd comments, bd list.
-        S
-        recording_instruction: '"bd comments add <id> RESULT: ..."',
-        traceability: <<~S,
-          Always link to the source: --deps "discovered-from:<source-issue-id>"
-          Create with: bd create "Prefix: title" --parent #{epic_id} --deps "discovered-from:<source-issue-id>" -p 2 --description="..."
-        S
-        goal_met_action: <<~S,
-          If the goal is met: create 0-1 cleanup/documentation issues, add a
-          comment to the epic recommending closure, and write a result file:
-
-          ```
-          cat > #{@project_dir}/_planning_result.md << 'PLANNING_EOF'
-          ---
-          outcome: completed
-          reason: "All epic objectives have been met: <brief explanation>"
-          ---
-          PLANNING_EOF
-          ```
-
-          Then EXIT. The driver reads this file and finalizes the walk.
-        S
-        verify_and_exit: <<~S
-          After creating issues:
-          1. List them to verify: bd list --parent #{epic_id} --status open
-          2. Write a result file:
-             ```
-             cat > #{@project_dir}/_planning_result.md << 'PLANNING_EOF'
-             ---
-             outcome: created_issues
-             reason: "Created N follow-up issues from generative findings"
-             ---
-             PLANNING_EOF
-             ```
-          3. Then EXIT. The driver will pick them up.
-
-          If you found no generative findings and created no issues:
-             ```
-             cat > #{@project_dir}/_planning_result.md << 'PLANNING_EOF'
-             ---
-             outcome: no_work_found
-             reason: "All closed issues are terminal; no new questions or gaps identified"
-             ---
-             PLANNING_EOF
-             ```
-          Then EXIT.
-        S
-      }
-      build_shared_planning_prompt(snippets)
     end
 
     def build_directory_planning_prompt(claude_md, backend)
@@ -672,14 +547,14 @@ module Walk
       build_shared_planning_prompt(snippets)
     end
 
-    # Shared planning prompt structure used by both backends.
-    # Accepts a hash of backend-specific snippets:
-    #   :preamble            - opening context (epic info or walk meta + closed issues)
+    # Planning prompt structure.
+    # Accepts a hash of snippets:
+    #   :preamble            - opening context (walk meta + closed issues)
     #   :exploration_steps   - how to review what's been done
     #   :recording_instruction - how the worker should record results
     #   :traceability        - how to link issues to their source
     #   :goal_met_action     - what to do if the goal is already met
-    #   :create_issue_how_to - (optional) how to create issues (directory backend)
+    #   :create_issue_how_to - how to create issues
     #   :verify_and_exit     - how to verify and exit
     def build_shared_planning_prompt(snippets)
       create_how_to = snippets[:create_issue_how_to] ? "\n#{snippets[:create_issue_how_to]}" : ""

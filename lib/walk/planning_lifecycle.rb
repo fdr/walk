@@ -18,7 +18,7 @@ module Walk
     # Initialize with the dependencies needed from Driver.
     #
     # Options:
-    #   backend:        a Walk::Backend instance
+    #   backend:        a Walk::DirectoryBackend instance
     #   prompt_builder: a Walk::PromptBuilder instance
     #   parent:         optional parent epic ID
     #   logs_dir:       directory for prompt/output logs

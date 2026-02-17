@@ -33,7 +33,6 @@ class WalkDriverTest < Minitest::Test
     @backend = Walk::DirectoryBackend.new(@tmpdir)
     @prompt_builder = Walk::PromptBuilder.new(
       project_dir: @tmpdir,
-      close_protocol: :result_md
     )
   end
 
@@ -176,7 +175,6 @@ class WalkDriverTest < Minitest::Test
 
     prompt = @prompt_builder.build_prompt(issue, backend: @backend)
     assert_includes prompt, "Issue: prompt-test"
-    assert_includes prompt, "Type: general"
     assert_includes prompt, "walk close"
   end
 
@@ -340,7 +338,6 @@ class WalkDriverTest < Minitest::Test
         model: opus
         sleep_interval: 10
         spawn_mode: stream
-        close_protocol: bd
         claude_md_path: /custom/CLAUDE.md
       ---
 
@@ -354,7 +351,6 @@ class WalkDriverTest < Minitest::Test
     assert_equal "opus", config[:model]
     assert_equal 10, config[:sleep_interval]
     assert_equal :stream, config[:spawn_mode]
-    assert_equal :bd, config[:close_protocol]
     assert_equal "/custom/CLAUDE.md", config[:claude_md_path]
   end
 
@@ -628,7 +624,7 @@ class WalkDriverTest < Minitest::Test
                "---\nclosed_at: 2026-01-30T10:00:00+00:00\nreason: done\n---\n")
 
     backend = Walk::DirectoryBackend.new(@tmpdir)
-    prompt_builder = Walk::PromptBuilder.new(project_dir: @tmpdir, close_protocol: :result_md)
+    prompt_builder = Walk::PromptBuilder.new(project_dir: @tmpdir)
     driver = Walk::Driver.new(backend: backend, prompt_builder: prompt_builder)
 
     output = StringIO.new
@@ -645,7 +641,7 @@ class WalkDriverTest < Minitest::Test
     create_issue("open-preview", title: "Open Preview Test")
 
     backend = Walk::DirectoryBackend.new(@tmpdir)
-    prompt_builder = Walk::PromptBuilder.new(project_dir: @tmpdir, close_protocol: :result_md)
+    prompt_builder = Walk::PromptBuilder.new(project_dir: @tmpdir)
     driver = Walk::Driver.new(backend: backend, prompt_builder: prompt_builder)
 
     output = StringIO.new
@@ -691,8 +687,8 @@ class WalkDriverTest < Minitest::Test
     prompt = @prompt_builder.build_planning_prompt(backend: @backend)
     assert_includes prompt, "done-task"
     assert_includes prompt, "Done Task"
-    assert_includes prompt, "Completed with findings."
-    assert_includes prompt, "More details."
+    # Planning prompt shows compact table; use `walk show` to expand
+    assert_includes prompt, "walk show"
   end
 
   def test_planning_prompt_result_md_no_closed_issues
@@ -733,25 +729,16 @@ class WalkDriverTest < Minitest::Test
     assert_includes prompt, "Deep exploration"
 
     # Step 3: triage
-    assert_includes prompt, "terminal vs generative"
+    assert_includes prompt, "Terminal"
+    assert_includes prompt, "Generative"
 
     # Step 4: create follow-ups
     assert_includes prompt, "Create follow-up issues"
     assert_includes prompt, "Discovered from:"
 
-    # Issue types
-    assert_includes prompt, "**Investigate:**"
-    assert_includes prompt, "**Experiment:**"
-    assert_includes prompt, "**Compare:**"
-    assert_includes prompt, "**Fix:**"
-
     # Quality rubric
-    assert_includes prompt, "**Goal**:"
-    assert_includes prompt, "**Success criteria**:"
-
-    # Anti-patterns
-    assert_includes prompt, "Anti-patterns to avoid"
-    assert_includes prompt, "DO NOT create issues with vague goals"
+    assert_includes prompt, "issue body IS the prompt"
+    assert_includes prompt, "close escape hatches"
 
     # Step 5: verify
     assert_includes prompt, "Verify and exit"
@@ -764,8 +751,7 @@ class WalkDriverTest < Minitest::Test
 
     builder = Walk::PromptBuilder.new(
       project_dir: @tmpdir,
-      claude_md_path: claude_md,
-      close_protocol: :result_md
+      claude_md_path: claude_md
     )
     prompt = builder.build_planning_prompt(backend: @backend)
     assert_includes prompt, "planning agent"
@@ -780,8 +766,7 @@ class WalkDriverTest < Minitest::Test
 
     builder = Walk::PromptBuilder.new(
       project_dir: @tmpdir,
-      claude_md_path: nonexistent,
-      close_protocol: :result_md
+      claude_md_path: nonexistent
     )
     prompt = builder.build_planning_prompt(backend: @backend)
     # Should not crash and should still include the planning structure
@@ -793,129 +778,6 @@ class WalkDriverTest < Minitest::Test
 
     prompt = @prompt_builder.build_planning_prompt(backend: @backend)
     assert_includes prompt, @tmpdir, "Planning prompt should reference the walk directory"
-  end
-
-  # =====================================================================
-  # Planning prompt tests: :bd (beads) protocol
-  # =====================================================================
-
-  def test_planning_prompt_bd_includes_epic_output
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :bd
-    )
-    epic_output = "EPIC: Investigate the widget system\nStatus: 5 issues closed"
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-123",
-      epic_output: epic_output
-    )
-    assert_includes prompt, "Investigate the widget system"
-    assert_includes prompt, "5 issues closed"
-  end
-
-  def test_planning_prompt_bd_includes_bd_create_instructions
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-42",
-      epic_output: "Epic description."
-    )
-    assert_includes prompt, "bd create"
-    assert_includes prompt, "bd list"
-    assert_includes prompt, "bd comments"
-    assert_includes prompt, "epic-42"
-  end
-
-  def test_planning_prompt_bd_includes_exploration_steps
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-99",
-      epic_output: "My epic."
-    )
-    assert_includes prompt, "List closed issues"
-    assert_includes prompt, "Read conclusions"
-    assert_includes prompt, "Do NOT re-read CLAUDE.md"
-  end
-
-  def test_planning_prompt_bd_includes_shared_structure
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-1",
-      epic_output: "Test epic."
-    )
-    # Shared planning structure
-    assert_includes prompt, "Assess epic-level progress"
-    assert_includes prompt, "terminal vs generative"
-    assert_includes prompt, "**Investigate:**"
-    assert_includes prompt, "**Goal**:"
-    assert_includes prompt, "Anti-patterns to avoid"
-    assert_includes prompt, "Verify and exit"
-  end
-
-  def test_planning_prompt_bd_includes_claude_md_when_present
-    claude_md = File.join(@tmpdir, "CLAUDE.md")
-    File.write(claude_md, "# BD Custom Instructions\n\nFollow these rules.")
-
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      claude_md_path: claude_md,
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-1",
-      epic_output: "Test."
-    )
-    assert_includes prompt, "BD Custom Instructions"
-    assert_includes prompt, "Follow these rules."
-  end
-
-  def test_planning_prompt_bd_omits_claude_md_when_missing
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      claude_md_path: "/tmp/does-not-exist-#{Process.pid}.md",
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-1",
-      epic_output: "Test."
-    )
-    # Should not crash
-    assert_includes prompt, "planning agent"
-  end
-
-  def test_planning_prompt_bd_goal_met_action
-    builder = Walk::PromptBuilder.new(
-      project_dir: @tmpdir,
-      close_protocol: :bd
-    )
-
-    prompt = builder.build_planning_prompt(
-      backend: @backend,
-      epic_id: "epic-1",
-      epic_output: "Test."
-    )
-    assert_includes prompt, "goal is met"
-    assert_includes prompt, "recommending closure"
   end
 
   # =====================================================================
@@ -965,58 +827,6 @@ class WalkDriverTest < Minitest::Test
     assert_equal :dry_run, result
     text = output.string
     assert_includes text, "Dir Planning Walk"
-  end
-
-  def test_spawn_planning_bd_backend_returns_skip_without_parent
-    # Create a mock backend that responds to fetch_epic_output
-    mock_bd = Object.new
-    def mock_bd.ready_issues(parent: nil); []; end
-    def mock_bd.fetch_epic_output(_id); "Epic output"; end
-
-    builder = Walk::PromptBuilder.new(project_dir: @tmpdir, close_protocol: :bd)
-    driver = Walk::Driver.new(
-      backend: mock_bd,
-      prompt_builder: builder,
-      parent: nil,  # No parent!
-      spawn_mode: :capture,
-      sleep_interval: 0,
-      logger: Logger.new(File::NULL)
-    )
-
-    result = driver.send(:spawn_planning_agent, dry_run: false)
-    assert_equal :skip, result
-  end
-
-  def test_spawn_planning_bd_backend_calls_fetch_epic_output
-    # Create a mock backend that responds to fetch_epic_output
-    mock_bd = Object.new
-    epic_called_with = nil
-    mock_bd.define_singleton_method(:ready_issues) { |parent: nil| [] }
-    mock_bd.define_singleton_method(:fetch_epic_output) { |id|
-      epic_called_with = id
-      "Epic: My Test Epic\nDescription here."
-    }
-
-    builder = Walk::PromptBuilder.new(project_dir: @tmpdir, close_protocol: :bd)
-    driver = Walk::Driver.new(
-      backend: mock_bd,
-      prompt_builder: builder,
-      parent: "my-epic",
-      spawn_mode: :capture,
-      sleep_interval: 0,
-      logger: Logger.new(File::NULL)
-    )
-
-    output = StringIO.new
-    $stdout = output
-    result = driver.send(:spawn_planning_agent, dry_run: true)
-    $stdout = STDOUT
-
-    assert_equal "my-epic", epic_called_with,
-                 "fetch_epic_output should have been called with the parent epic id"
-    assert_equal :dry_run, result
-    text = output.string
-    assert_includes text, "My Test Epic"
   end
 
   # =====================================================================

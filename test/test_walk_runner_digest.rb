@@ -11,14 +11,17 @@ require "minitest/autorun"
 require "json"
 require "tmpdir"
 
+require_relative "../lib/walk/directory_backend"
 require_relative "../lib/walk/driver"
 
 class WalkRunnerDigestTest < Minitest::Test
   def setup
-    backend = Walk::Backend.new
-    prompt_builder = Walk::PromptBuilder.new(project_dir: __dir__, claude_md_path: "/dev/null")
-    @runner = Walk::Driver.new(backend: backend, prompt_builder: prompt_builder)
     @tmpdir = Dir.mktmpdir("walk-digest-test")
+    FileUtils.mkdir_p(File.join(@tmpdir, "open"))
+    FileUtils.mkdir_p(File.join(@tmpdir, "closed"))
+    backend = Walk::DirectoryBackend.new(@tmpdir)
+    prompt_builder = Walk::PromptBuilder.new(project_dir: @tmpdir, claude_md_path: "/dev/null")
+    @runner = Walk::Driver.new(backend: backend, prompt_builder: prompt_builder)
   end
 
   def teardown
