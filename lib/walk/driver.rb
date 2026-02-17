@@ -447,11 +447,7 @@ module Walk
           Array(@command)
         else
           base = ["claude", "--print", "--dangerously-skip-permissions"]
-          turns = if max_turns == :extended && @max_turns
-                    @max_turns * AgentRunner::EXTENDED_TURN_MULTIPLIER
-                  else
-                    max_turns || @max_turns
-                  end
+          turns = max_turns || @max_turns
           base += ["--max-turns", turns.to_s] if turns
           base += ["--model", @model] if @model
           base

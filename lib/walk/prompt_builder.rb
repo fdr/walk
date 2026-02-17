@@ -20,43 +20,24 @@ module Walk
       @close_protocol = close_protocol
     end
 
-    # Detect issue type from title prefix or slug pattern.
+    # Extract issue type prefix from title or slug for logging.
+    # Returns a simple string (e.g. "investigate", "fix", "meta").
+    # No fixed enum — just extracts the prefix as-is.
     def issue_type(issue)
       title = issue[:title] || ""
       slug = issue[:slug] || issue[:id] || ""
 
-      # First try title prefix (canonical)
-      case title
-      when /^Investigate:/i then return :investigate
-      when /^Instrument:/i  then return :instrument
-      when /^Trace:/i       then return :trace
-      when /^Test:/i        then return :test
-      when /^Compare:/i     then return :compare
-      when /^Experiment:/i  then return :experiment
-      when /^Fix:/i         then return :fix
-      when /^Ablation:/i    then return :ablation
+      # Extract prefix from title (e.g. "Fix: foo" -> "fix")
+      if (m = title.match(/^([A-Za-z][\w-]*)\s*:/))
+        return m[1].downcase
       end
 
-      # Fallback: check slug pattern (planners often use descriptive slugs)
-      case slug
-      when /^investigate-/i then :investigate
-      when /^instrument-/i  then :instrument
-      when /^trace-/i       then :trace
-      when /^test-/i        then :test
-      when /^compare-/i     then :compare
-      when /^experiment-/i  then :experiment
-      when /^benchmark-/i   then :experiment
-      when /^fix-/i         then :fix
-      when /^ablation-/i    then :ablation
-      when /^meta-/i        then :meta
-      else                       :general
+      # Fallback: extract prefix from slug (e.g. "fix-foo" -> "fix")
+      if (m = slug.match(/^([a-z][\w]*)-/))
+        return m[1]
       end
-    end
 
-    # Type-specific task instructions for the worker agent.
-    def task_instructions(type)
-      instructions = build_task_instructions
-      instructions.fetch(type, instructions[:general])
+      "general"
     end
 
     # Build the full agent prompt for working on a single issue.
@@ -344,7 +325,7 @@ module Walk
         8. #{snippets[:git_branch_doc]}
       GIT
       parts << <<~NAMING.chomp
-        SUB-ISSUE NAMING (optional prefixes, helps driver pick instructions):
+        SUB-ISSUE NAMING (optional prefixes for clarity, not enforced):
         - Investigate: - research/analysis, understanding behavior
         - Experiment: - trying things, running benchmarks
         - Compare: - A vs B measurements
@@ -353,7 +334,8 @@ module Walk
         - Instrument: - adding logging/tracing to code
         - Ablation: - removing/simplifying code to test necessity
         - Meta: - improving walk itself (source in ~/walk/)
-        Or just use a descriptive title.
+        These are conventions that have been empirically useful. Use them
+        when they fit, or use your own descriptive prefix or none at all.
       NAMING
       parts << <<~SELFMOD.chomp
         SELF-MODIFICATION (for Meta: issues only):
@@ -769,7 +751,7 @@ module Walk
         Review executor behavior from the closed issues. Consider:
 
         - Did executors misunderstand instructions? → The issue body IS the prompt.
-          Fix in prompt_builder.rb (task instructions, epilogue, planning prompt).
+          Fix in prompt_builder.rb (epilogue, planning prompt).
         - Did executors lack CLI features? → Add a new walk subcommand in bin/walk.
         - Did driver behavior cause problems? → Fix in lib/walk/driver.rb.
         - Did planning produce poor issue descriptions? → Fix the planning prompt
@@ -786,8 +768,9 @@ module Walk
         - `lib/walk/driver.rb` — Core loop: pick issues, spawn agents, plan.
           EXIT_CODE_RESTART=42 triggers trampoline restart.
         - `lib/walk/prompt_builder.rb` — Builds agent and planning prompts.
-          Issue types: investigate, instrument, trace, test, compare, experiment,
-          fix, ablation, meta, general. Each has task_instructions().
+          Issue type prefixes (investigate, fix, meta, etc.) are conventions for
+          clarity, not enforced by the driver. `issue_type()` extracts the prefix
+          as a string for logging only.
           Planning prompt: 5-step process (assess, explore, evaluate, create, verify).
         - `lib/walk/agent_runner.rb` — Spawns claude, captures output, detects results.
         - `lib/walk/planning_lifecycle.rb` — Planning agent spawning, result parsing.
@@ -795,9 +778,9 @@ module Walk
         - `lib/walk/directory_backend.rb` — File-based issue storage (open/, closed/).
 
         Create 0-1 "Meta: ..." issues per planning round if a concrete improvement
-        exists. Use the `meta` issue type. Be specific: name the file, method, and
-        what to change. The executor for meta issues will modify walk source and call
-        `walk self-modify --reason "..."` to trigger a trampoline restart.
+        exists. Be specific: name the file, method, and what to change. The executor
+        for meta issues will modify walk source and call `walk self-modify --reason "..."`
+        to trigger a trampoline restart.
 
         Be cognizant that executor run logs can be very large (10K+ lines). If you
         find yourself unable to effectively review executor behavior due to log size,
@@ -864,105 +847,5 @@ module Walk
       PROMPT
     end
 
-    # rubocop:disable Metrics/MethodLength
-    def build_task_instructions
-      doc = doc_instruction
-      {
-        investigate: <<~TASK,
-          INVESTIGATION TASK:
-          - Read the issue description carefully
-          - Search source code, read files, analyze structure
-          - #{doc}
-          - If you find actionable items, create child issues
-          - Close with summary of what you learned
-        TASK
-        instrument: <<~TASK,
-          INSTRUMENTATION TASK:
-          - Add logging/tracing to specified code paths
-          - Rebuild the affected component
-          - Verify instrumentation compiles and runs
-          - Document what output to expect
-          - Close with instructions for running instrumented version
-        TASK
-        test: <<~TASK,
-          TEST TASK:
-          - Run the test scenario described in the issue
-          - Capture all relevant output
-          - Analyze results and document findings
-          - Create follow-up issues if problems found
-          - Close with test results summary
-        TASK
-        compare: <<~TASK,
-          COMPARISON TASK:
-          - Run the scenarios described in the issue
-          - Capture data from each variant
-          - Identify specific differences
-          - Document which aspects differ and how
-          - Close with comparison summary
-        TASK
-        trace: <<~TASK,
-          TRACE TASK:
-          - Follow execution flow through the specified code path
-          - Read source files to understand the call chain
-          - #{doc}
-          - Identify key decision points and data transformations
-          - Close with summary of the traced flow
-        TASK
-        experiment: <<~TASK,
-          EXPERIMENT TASK:
-          - Try the experimental approach described in the issue
-          - Document what you tried and what happened
-          - Capture output/logs as evidence
-          - Analyze results - did it work? why or why not?
-          - Create follow-up issues based on findings
-          - Close with experiment results summary
-        TASK
-        fix: <<~TASK,
-          FIX TASK:
-          - Implement the fix described in the issue
-          - Rebuild and test
-          - Verify the original problem is resolved
-          - Document any side effects or limitations
-          - Close with description of fix and test results
-        TASK
-        ablation: <<~TASK,
-          ABLATION TASK:
-          - Identify the mechanism to remove or simplify (branch, conditional, function)
-          - Make the change and rebuild
-          - Run tests to verify system function is not impaired
-          - Measure for performance regression if applicable
-          - Document detailed observations on any differences caused
-          - Close with confirmation the ablation is safe, or explanation of why it's needed
-        TASK
-        meta: <<~TASK,
-          META-IMPROVEMENT TASK (modifying walk itself):
-          - The walk source lives in ~/walk/ (bin/walk, lib/walk/*.rb)
-          - Read the issue description for what to change
-          - Read the relevant walk source files BEFORE modifying
-          - Make targeted, minimal changes — do not refactor unrelated code
-          - After modifying, run: ruby -c <file> to verify syntax for each changed file
-          - Test your changes if possible (e.g., run `walk --help` to verify CLI changes)
-          - Call `walk self-modify --reason "Brief description"` to commit and request restart
-          - The trampoline will restart walk with your changes on the next iteration
-          - Close with summary of what was changed and why
-        TASK
-        general: <<~TASK
-          TASK:
-          - Read the issue description - it tells you what to do
-          - #{doc}
-          - Create sub-issues if you discover follow-up work
-          - Close with summary of what was done or learned
-        TASK
-      }
-    end
-    # rubocop:enable Metrics/MethodLength
-
-    def doc_instruction
-      if @close_protocol == :bd
-        "Document findings as you go with bd comments add"
-      else
-        "Document findings as you go using: walk comment \"your notes here\""
-      end
-    end
   end
 end

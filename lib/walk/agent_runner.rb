@@ -264,21 +264,11 @@ module Walk
       end
     end
 
-    # Issue types that typically need more turns (code changes, testing, committing).
-    EXTENDED_TURN_TYPES = %i[fix meta ablation].freeze
-    EXTENDED_TURN_MULTIPLIER = 2
-
     def work_issue_capture(issue, issue_id, prompt)
-      type = @prompt_builder.issue_type(issue)
-      if EXTENDED_TURN_TYPES.include?(type)
-        log(:info, "Issue type :#{type} — using extended max_turns (#{EXTENDED_TURN_MULTIPLIER}x)")
-      end
-
       log(:info, "Spawning Claude agent (capture mode)...")
       with_backend_lock { @backend.add_comment(issue_id, "Agent spawned by walk driver") }
 
-      max_turns_for_type = EXTENDED_TURN_TYPES.include?(type) ? :extended : nil
-      cmd = @build_cmd.call(prompt, mode: :capture, max_turns: max_turns_for_type)
+      cmd = @build_cmd.call(prompt, mode: :capture)
 
       env = {}
       # Set env vars for directory-backend agents
