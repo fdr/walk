@@ -276,6 +276,17 @@ module Walk
           - This lets the user communicate with you while you run
           - After responding to feedback, use `walk show` to verify issue state
         S
+        steering: <<~S.chomp,
+          STEERING (always active):
+          At the start of your work, launch a background listener:
+            walk await --timeout 300 &
+          This runs continuously. When a human sends feedback via `walk notify`,
+          the background task completes and you receive the message. Read it,
+          incorporate the direction, and relaunch:
+            walk await --timeout 300 &
+          The human can steer you at any time without restarting the agent.
+          If the background task times out (exit code 1), simply relaunch it.
+        S
         git_branch_doc: "Document the branch name using: walk comment \"Branch: <branch-name>\""
       }
     end
@@ -284,10 +295,12 @@ module Walk
     # Accepts a hash of snippets:
     #   :driver_protocol        - scope, progress docs, close commands
     #   :live_comment_watching  - how to check for user feedback during execution
+    #   :steering               - walk await/notify background listener
     #   :git_branch_doc         - how to document git branch name
     def build_shared_epilogue(snippets)
       parts = [snippets[:driver_protocol]]
       parts << snippets[:live_comment_watching] if snippets[:live_comment_watching]
+      parts << snippets[:steering] if snippets[:steering]
       parts << <<~GIT.chomp
         GIT HYGIENE (other agents share these trees):
         If you modify source code in any shared repo:

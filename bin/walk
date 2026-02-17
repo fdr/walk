@@ -1307,6 +1307,165 @@ def cmd_discard_proposal(args)
   end
 end
 
+# --- Subcommand: await ---
+
+def cmd_await(args)
+  timeout = 300
+  json_output = false
+  walk_dir_flag = nil
+  slug_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk await [--timeout SECONDS] [--walk-dir PATH] [--slug SLUG]"
+    opts.on("--timeout N", Integer, "Timeout in seconds (default: 300)") { |n| timeout = n }
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--slug SLUG", "Issue slug (overrides WALK_ISSUE env)") { |s| slug_flag = s }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  slug = slug_flag || ENV["WALK_ISSUE"]
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  unless slug
+    $stderr.puts "Error: WALK_ISSUE env var or --slug must be set"
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  # Resolve issue directory (check open/ and closed/)
+  issue_dir = Dir.exist?(File.join(walk_dir, "open", slug)) ?
+    File.join(walk_dir, "open", slug) :
+    File.join(walk_dir, "closed", slug)
+
+  fifo_path = File.join(issue_dir, ".notify-fifo")
+
+  # Create FIFO if it doesn't exist
+  unless File.exist?(fifo_path)
+    system("mkfifo", fifo_path)
+  end
+
+  # Clean up FIFO on exit
+  cleanup = -> {
+    File.delete(fifo_path) if File.exist?(fifo_path) && File.pipe?(fifo_path)
+  }
+  trap("INT") { cleanup.call; exit 1 }
+  trap("TERM") { cleanup.call; exit 1 }
+
+  # Open FIFO for reading with timeout using IO.select
+  # We open in non-blocking mode first so open() itself doesn't block
+  # (opening a FIFO for reading blocks until a writer opens it on Linux,
+  # unless we use RDONLY|NONBLOCK)
+  begin
+    fd = IO.sysopen(fifo_path, File::RDONLY | File::NONBLOCK)
+    fifo = IO.new(fd)
+  rescue Errno::ENOENT
+    $stderr.puts "Error: FIFO not found at #{fifo_path}"
+    exit 1
+  end
+
+  # Wait for data with timeout
+  ready = IO.select([fifo], nil, nil, timeout)
+
+  if ready
+    message = fifo.read.strip
+    fifo.close
+    cleanup.call
+
+    if message.empty?
+      # Writer opened and closed without data (EOF). Treat as timeout.
+      output({ status: "timeout", timeout: timeout }, json: json_output) do |_|
+        # No output on timeout
+      end
+      exit 1
+    end
+
+    output({ status: "notified", message: message }, json: json_output) do |r|
+      puts r[:message]
+    end
+    exit 0
+  else
+    fifo.close
+    cleanup.call
+    output({ status: "timeout", timeout: timeout }, json: json_output) do |_|
+      # No output on timeout
+    end
+    exit 1
+  end
+end
+
+# --- Subcommand: notify ---
+
+def cmd_notify(args)
+  json_flag = false
+  walk_dir_flag = nil
+  slug_flag = nil
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk notify 'message' [--walk-dir PATH] [--slug SLUG] [--json]"
+    opts.on("--walk-dir PATH", "Walk directory (overrides WALK_DIR env)") { |p| walk_dir_flag = p }
+    opts.on("--slug SLUG", "Issue slug (overrides WALK_ISSUE env)") { |s| slug_flag = s }
+    opts.on("--json", "Treat message as JSON") { json_flag = true }
+  end
+  parser.parse!(args)
+
+  message = args.join(" ")
+  slug = slug_flag || ENV["WALK_ISSUE"]
+  walk_dir = walk_dir_flag || resolve_walk_dir(nil)
+
+  if message.empty?
+    $stderr.puts "Error: message required"
+    exit 1
+  end
+  unless slug
+    $stderr.puts "Error: WALK_ISSUE env var or --slug must be set"
+    exit 1
+  end
+  unless walk_dir
+    $stderr.puts "Error: WALK_DIR env var or --walk-dir must be set"
+    exit 1
+  end
+
+  # Validate JSON if --json flag was given
+  if json_flag
+    begin
+      JSON.parse(message)
+    rescue JSON::ParserError => e
+      $stderr.puts "Error: invalid JSON: #{e.message}"
+      exit 1
+    end
+  end
+
+  # Resolve issue directory (check open/ and closed/)
+  issue_dir = Dir.exist?(File.join(walk_dir, "open", slug)) ?
+    File.join(walk_dir, "open", slug) :
+    File.join(walk_dir, "closed", slug)
+
+  fifo_path = File.join(issue_dir, ".notify-fifo")
+
+  # Also record in comments.md for permanence
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  backend.add_comment(slug, "[notify] #{message}")
+
+  # Write to FIFO if it exists (non-blocking: if no reader, skip)
+  if File.exist?(fifo_path) && File.pipe?(fifo_path)
+    begin
+      # Open with WRONLY|NONBLOCK — fails with ENXIO if no reader
+      fd = IO.sysopen(fifo_path, File::WRONLY | File::NONBLOCK)
+      fifo = IO.new(fd)
+      fifo.write(message)
+      fifo.close
+      puts "Notified (delivered to waiting agent): #{message}"
+    rescue Errno::ENXIO
+      # No reader on the FIFO — message still recorded in comments.md
+      puts "Notified (no agent waiting, recorded in comments): #{message}"
+    end
+  else
+    puts "Notified (no FIFO, recorded in comments): #{message}"
+  end
+end
+
 # --- Subcommand: proposals ---
 
 def cmd_proposals(args)
@@ -1370,7 +1529,9 @@ SUBCOMMANDS = {
   "propose"          => method(:cmd_propose),
   "accept-proposal"  => method(:cmd_accept_proposal),
   "discard-proposal" => method(:cmd_discard_proposal),
-  "proposals"        => method(:cmd_proposals)
+  "proposals"        => method(:cmd_proposals),
+  "await"            => method(:cmd_await),
+  "notify"           => method(:cmd_notify)
 }.freeze
 
 def main
@@ -1413,6 +1574,10 @@ def main
         walk accept-proposal <key>                Accept proposal (promote to memory)
         walk discard-proposal <key>               Discard proposal
         walk proposals                            List pending proposals
+
+      Steering (mid-flight agent direction):
+        walk await [--timeout N]                  Block until notified (default: 300s)
+        walk notify 'message'                     Send message to waiting agent
 
       All subcommands support --json for structured output.
     HELP
