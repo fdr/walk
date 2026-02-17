@@ -33,6 +33,7 @@ require_relative "../lib/walk/directory_backend"
 require_relative "../lib/walk/prompt_builder"
 require_relative "../lib/walk/reporting"
 require_relative "../lib/walk/driver"
+require_relative "../lib/walk/visualizer"
 
 # ---------------------------------------------------------------------------
 # CLI subcommands
@@ -754,6 +755,41 @@ def cmd_tree(args)
   end
 end
 
+# --- Subcommand: chain ---
+
+def cmd_chain(args)
+  compact = false
+  json_output = false
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: walk chain <name> [--compact]"
+    opts.on("--compact", "Show compact timeline only") { compact = true }
+    opts.on("--json", "Output as JSON") { json_output = true }
+  end
+  parser.parse!(args)
+
+  name = args.shift
+  walk_dir = resolve_walk_dir(name)
+  unless walk_dir && Dir.exist?(walk_dir)
+    $stderr.puts "Error: walk directory not found: #{name}"
+    exit 1
+  end
+
+  backend = Walk::DirectoryBackend.new(walk_dir)
+  viz = Walk::Visualizer.new(backend)
+
+  if compact
+    lines = viz.render_timeline
+  else
+    lines = viz.render_chain(include_closed: true)
+  end
+
+  if json_output
+    puts JSON.pretty_generate({ lines: lines })
+  else
+    puts lines.join("\n")
+  end
+end
+
 # ---------------------------------------------------------------------------
 # Main dispatch
 # ---------------------------------------------------------------------------
@@ -1082,6 +1118,7 @@ SUBCOMMANDS = {
   "history"     => method(:cmd_history),
   "summary"     => method(:cmd_summary),
   "tree"        => method(:cmd_tree),
+  "chain"       => method(:cmd_chain),
   "table"       => method(:cmd_table),
   "show"        => method(:cmd_show),
   "close"       => method(:cmd_close),
@@ -1112,6 +1149,7 @@ def main
         walk summary <name>                            Markdown summary report
         walk tree <name> [--mode MODE] [--root SLUG]   Show issue hierarchy
               MODE: discovery (parent->children) or blocking (execution order)
+        walk chain <name> [--compact]                  Discovery chain with epochs
         walk table <name> [--min-bytes N]              Compact epoch table of closed issues
 
       Agent-facing (WALK_DIR/WALK_ISSUE env vars, or --walk-dir/--slug flags):
