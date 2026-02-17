@@ -397,7 +397,82 @@ module Walk
       { bytes: total_bytes, signals: signals, issues: slugs }
     end
 
+    # Compute expansion ratio statistics from closed issues.
+    # Returns how much context each issue generates relative to its initial body.
+    def expansion_stats
+      closed_dir = File.join(@walk_dir, "closed")
+      return empty_expansion_stats unless Dir.exist?(closed_dir)
+
+      per_issue = []
+
+      Dir.glob(File.join(closed_dir, "*")).each do |dir|
+        next unless Dir.exist?(dir)
+
+        issue = read_closed_issue(dir)
+        next unless issue
+
+        initial_bytes = (issue[:body] || "").bytesize
+        next if initial_bytes == 0
+
+        # closed_bytes = what the executor produced (result + comments)
+        closed_bytes = 0
+        result_file = File.join(dir, "result.md")
+        closed_bytes += File.size(result_file) if File.exist?(result_file)
+        comments_file = File.join(dir, "comments.md")
+        closed_bytes += File.size(comments_file) if File.exist?(comments_file)
+
+        ratio = closed_bytes.to_f / initial_bytes
+
+        per_issue << {
+          slug: issue[:slug],
+          type: issue[:type] || "task",
+          initial_bytes: initial_bytes,
+          closed_bytes: closed_bytes,
+          ratio: ratio
+        }
+      end
+
+      return empty_expansion_stats if per_issue.empty?
+
+      ratios = per_issue.map { |i| i[:ratio] }.sort
+      overall = {
+        count: per_issue.length,
+        median_ratio: percentile(ratios, 50),
+        p75_ratio: percentile(ratios, 75),
+        total_initial: per_issue.sum { |i| i[:initial_bytes] },
+        total_closed: per_issue.sum { |i| i[:closed_bytes] }
+      }
+
+      by_type = {}
+      per_issue.group_by { |i| i[:type] }.each do |type, issues|
+        type_ratios = issues.map { |i| i[:ratio] }.sort
+        by_type[type] = {
+          count: issues.length,
+          median_ratio: percentile(type_ratios, 50),
+          p75_ratio: percentile(type_ratios, 75)
+        }
+      end
+
+      { overall: overall, by_type: by_type }
+    end
+
     private
+
+    def empty_expansion_stats
+      { overall: { count: 0, median_ratio: 0.0, p75_ratio: 0.0, total_initial: 0, total_closed: 0 }, by_type: {} }
+    end
+
+    def percentile(sorted_array, pct)
+      return 0.0 if sorted_array.empty?
+      return sorted_array.first if sorted_array.length == 1
+
+      k = (pct / 100.0) * (sorted_array.length - 1)
+      f = k.floor
+      c = k.ceil
+      return sorted_array[f].round(2) if f == c
+
+      ((sorted_array[f] * (c - k)) + (sorted_array[c] * (k - f))).round(2)
+    end
 
     # Acquire an exclusive file lock on a walk-level lockfile.
     # Provides defense-in-depth against concurrent writes from multiple
