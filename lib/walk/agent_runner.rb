@@ -13,6 +13,9 @@ require_relative "reporting"
 
 module Walk
   class AgentRunner
+    # Kill agent after 15 minutes of no output file writes.
+    AGENT_STALE_TIMEOUT = 15 * 60
+
     # Initialize with the dependencies needed from Driver.
     #
     # Options:
@@ -189,7 +192,7 @@ module Walk
       stdin_w.write(prompt)
       stdin_w.close
 
-      exit_code = wait_for_agent(pid)
+      exit_code = wait_for_agent(pid, output_file: output_file)
       finished_at = Time.now
 
       # Remove the runs/ symlink now that agent is done
@@ -342,7 +345,39 @@ module Walk
       result
     end
 
-    def wait_for_agent(pid)
+    def wait_for_agent(pid, output_file: nil)
+      watchdog = nil
+
+      if output_file
+        watchdog = Thread.new do
+          loop do
+            sleep 60
+            # Check if agent is still alive
+            begin
+              Process.kill(0, pid)
+            rescue Errno::ESRCH, Errno::EPERM
+              break # Agent already dead
+            end
+
+            # Check output file staleness
+            if File.exist?(output_file)
+              stale_seconds = Time.now - File.mtime(output_file)
+              if stale_seconds > AGENT_STALE_TIMEOUT
+                log(:warn, "Watchdog: agent #{pid} output stale for #{stale_seconds.round}s (threshold: #{AGENT_STALE_TIMEOUT}s), killing")
+                begin
+                  Process.kill("TERM", pid)
+                  sleep 5
+                  Process.kill("KILL", pid)
+                rescue Errno::ESRCH
+                  # Already dead
+                end
+                break
+              end
+            end
+          end
+        end
+      end
+
       Process.wait(pid)
       status = $?
       exit_code = status.exitstatus || status.termsig
@@ -359,6 +394,8 @@ module Walk
     rescue Errno::ECHILD
       log(:warn, "Claude process already reaped")
       -1
+    ensure
+      watchdog&.kill
     end
 
     def write_stream_run_meta(issue, timestamp, prompt, output_file,
