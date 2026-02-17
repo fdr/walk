@@ -82,6 +82,8 @@ module Walk
         ---
 
         #{epilogue}
+
+        YOUR TASK: #{issue_title}. Refer to the issue body above for goals, method, and close criteria.
       PROMPT
     end
 
@@ -224,14 +226,13 @@ module Walk
       {
         driver_protocol: <<~S.chomp,
           DRIVER PROTOCOL:
-          - Work ONLY on issue #{id}. Do NOT expand scope.
+          - Work ONLY on issue #{id}.
           - Read issue first: bd show #{id}
           - Document approach: bd comments add #{id} "Chose <approach> because <why>"
           - Document findings as you go: bd comments add #{id} "<what-you-learned>"
           - Create sub-issues for follow-up work: bd create "Prefix: title" --parent #{id} --deps "discovered-from:#{id}" --description="..."
             (The --deps flag links back to THIS issue for context. Always include it so readers know where the task came from.)
-          - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
-          - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
+          - Close with concrete results: data, traces, measurements, or verified code
           - Close with rationale: bd close #{id} --reason "<specific-finding-or-result>"
           - EXIT immediately after closing. The driver restarts you with fresh context.
         S
@@ -254,18 +255,17 @@ module Walk
       {
         driver_protocol: <<~S.chomp,
           DRIVER PROTOCOL:
-          - Work ONLY on this issue. Do NOT expand scope.
-          - ALWAYS use the walk CLI for state mutations. NEVER manipulate the filesystem directly:
-            - To close: `walk close --reason "..."` (NOT: writing close.yaml or moving directories)
-            - To comment: `walk comment "..."` (NOT: appending to comments.md)
-            - To create issues: `walk create <slug> --title "..." --body "..."` (NOT: mkdir + write issue.md)
+          - Work ONLY on this issue.
+          - Use the walk CLI for all state mutations:
+            - To close: `walk close --reason "..."`
+            - To comment: `walk comment "..."`
+            - To create issues: `walk create <slug> --title "..." --body "..."`
             - To read: filesystem reads are fine (cat, ls, grep, walk show, walk list)
           - The walk CLI handles locking, validation, and state transitions safely.
             Direct filesystem writes can race with the driver and corrupt state.
           - Document approach and findings as you go using: walk comment "your notes here"
           - Create sub-issues for follow-up work using: walk create <slug> --title "..." --derived-from <current-issue> --body "..."
-          - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
-          - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
+          - Close with concrete results: data, traces, measurements, or verified code
           - TO CLOSE: walk close --reason "Brief summary of what was accomplished"
             Then EXIT immediately. The driver handles the rest.
 
@@ -307,21 +307,21 @@ module Walk
       parts = [snippets[:driver_protocol]]
       parts << snippets[:live_comment_watching] if snippets[:live_comment_watching]
       parts << <<~GIT.chomp
-        GIT HYGIENE (MANDATORY -- other agents share these trees):
+        GIT HYGIENE (other agents share these trees):
         If you modify source code in any shared repo:
-        1. EXPLORE first: run `git branch` and `git log --oneline --all --graph | head -30`
+        1. Explore first: run `git branch` and `git log --oneline --all --graph | head -30`
            to understand the branch topology. Other agents may have created branches
            with fixes you need. Branch names are descriptive.
-        2. DECIDE where to base your work:
+        2. Decide where to base your work:
            - If a branch already has the fix/feature you need, branch from it or commit on it
            - If starting fresh, branch from the most relevant existing branch
            - Bug fixes: fix-<thing> (e.g., fix-vhost-polling)
            - Experiments: experiment/<thing> (e.g., experiment/gso-batching)
         3. Make atomic commits with clear messages describing what and why
         4. After building and testing, verify the branch is clean (git status)
-        5. NEVER leave uncommitted changes -- commit or stash before exiting
-        6. NEVER force-push or delete existing branches
-        7. NEVER commit to master/main directly
+        5. Commit or stash all changes before exiting
+        6. Preserve all existing branches (no force-push or deletion)
+        7. Create a named branch for your work (not master/main)
         8. #{snippets[:git_branch_doc]}
       GIT
       parts << <<~NAMING.chomp
@@ -373,8 +373,7 @@ module Walk
           4. Check git state of repos that were modified: git log --oneline -5 in relevant repos
           5. Read any source files that recent issues referenced as changed
 
-          Do NOT re-read CLAUDE.md (it is already in your context above).
-          Do NOT spend time learning bd CLI syntax (use: bd create, bd comments, bd list).
+          CLAUDE.md is already in your context above. For bd CLI, use: bd create, bd comments, bd list.
         S
         recording_instruction: '"bd comments add <id> RESULT: ..."',
         traceability: <<~S,
@@ -625,8 +624,8 @@ module Walk
           What the agent should report when done."
           ```
 
-          IMPORTANT: Always use `walk create` to make issues. Do NOT create directories or write issue.md files directly.
-          Use `walk list` to verify issues were created. The CLI handles locking and validation.
+          Always use `walk create` to make issues — the CLI handles locking and validation.
+          Use `walk list` to verify issues were created.
 
           Always specify --derived-from to record where this issue came from (epistemic
           provenance — what you learned that led to this issue). Multiple sources are
@@ -699,11 +698,13 @@ module Walk
         - What was the epic's goal?
         - Is that goal met, nearly met, or still far away?
         - What concrete gaps remain?
+        - What is your single largest uncertainty about whether the goal is met?
+          (If you cannot articulate one, the assessment is more trustworthy.)
 
         #{snippets[:goal_met_action]}
         If gaps remain: proceed to Step 2.
 
-        ## Step 2: Deep exploration (REQUIRED before creating issues)
+        ## Step 2: Deep exploration (before creating any issues)
 
         #{snippets[:exploration_steps]}
         ## Step 3: Expand and critically evaluate
@@ -815,12 +816,19 @@ module Walk
         commands and file paths. The key addition: **close escape hatches** based on
         how previous executors failed.
 
+        Weak (executor will drift):
+          "Investigate IPsec performance. Check if it's slow."
+        Strong (executor has a clear path):
+          "Measure iperf3 throughput between VM1 and VM2 over plain IPv6 vs ESP
+           tunnel. Run 30s with -P 4. Record per-core CPU%.
+           ## Close with: plain IPv6 Gbps, ESP Gbps, which cores saturated."
+
         ### Strengthen based on execution history
 
         When you evaluated execution quality in Step 3, you identified how prompts
         failed. Use that to strengthen follow-up issues:
 
-        - Executor substituted easier work → "Do X. Do NOT do Y instead."
+        - Executor substituted easier work → specify the exact method and add verification criteria
         - Executor stopped at blocker → include workaround, or create dependency first
         - Executor produced shallow output → add depth requirements, minimum counts
         - Executor rationalized impossibility → close the escape: "This is achievable
