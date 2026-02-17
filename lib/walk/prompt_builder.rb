@@ -339,11 +339,17 @@ module Walk
       NAMING
       parts << <<~SELFMOD.chomp
         SELF-MODIFICATION (for Meta: issues only):
-        Walk source lives in ~/walk/. To modify walk and trigger a restart:
+        Walk source lives in ~/walk/ (git repo). To modify walk and trigger a restart:
         1. Edit walk source files (bin/walk, lib/walk/*.rb)
-        2. Verify syntax: ruby -c <modified-file>
-        3. Run: walk self-modify --reason "Brief description of change"
-        This commits, writes a restart marker, and the trampoline restarts walk.
+        2. Verify syntax: for f in ~/walk/lib/walk/*.rb ~/walk/bin/walk; do ruby -c "$f"; done
+        3. Commit: cd ~/walk && git add -A && git commit -m "general: description"
+           or: git commit -m "provisional: description"
+           (general = candidate for permanent inclusion; provisional = project-specific, expected to be discarded)
+        4. Write restart marker: echo "description" > $WALK_DIR/_restart_requested
+        5. The trampoline restarts walk on the next iteration.
+
+        To review accumulated walk changes since last known-good state:
+          cd ~/walk && git diff $(cat .last_good_commit)..HEAD
       SELFMOD
       parts.join("\n\n")
     end
@@ -780,8 +786,8 @@ module Walk
 
         Create 0-1 "Meta: ..." issues per planning round if a concrete improvement
         exists. Be specific: name the file, method, and what to change. The executor
-        for meta issues will modify walk source and call `walk self-modify --reason "..."`
-        to trigger a trampoline restart.
+        for meta issues will modify walk source in ~/walk/, commit with git, and write
+        a restart marker to $WALK_DIR/_restart_requested to trigger a trampoline restart.
 
         Be cognizant that executor run logs can be very large (10K+ lines). If you
         find yourself unable to effectively review executor behavior due to log size,

@@ -1190,67 +1190,6 @@ def cmd_memories(args)
   end
 end
 
-# --- Subcommand: self-modify ---
-
-def cmd_self_modify(args)
-  reason = nil
-  parser = OptionParser.new do |opts|
-    opts.banner = "Usage: walk self-modify --reason 'description'"
-    opts.on("--reason REASON", "Reason for the modification (required)") { |r| reason = r }
-  end
-  parser.parse!(args)
-
-  reason ||= args.join(" ")
-  if reason.nil? || reason.empty?
-    $stderr.puts "Error: --reason is required"
-    $stderr.puts parser.help
-    exit 1
-  end
-
-  walk_repo_dir = File.expand_path(File.join(__dir__, ".."))
-  walk_dir = ENV["WALK_DIR"]
-
-  # 1. Syntax check all walk source files
-  $stderr.puts "Checking syntax..."
-  rb_files = Dir.glob(File.join(walk_repo_dir, "lib", "**", "*.rb")) +
-             Dir.glob(File.join(walk_repo_dir, "bin", "walk"))
-  errors = []
-  rb_files.each do |f|
-    output = `ruby -c #{f.shellescape} 2>&1`
-    unless $?.success?
-      errors << "#{f}: #{output.strip}"
-    end
-  end
-
-  unless errors.empty?
-    $stderr.puts "Syntax errors found:"
-    errors.each { |e| $stderr.puts "  #{e}" }
-    exit 1
-  end
-  $stderr.puts "Syntax OK (#{rb_files.size} files)."
-
-  # 2. Commit changes in walk repo
-  $stderr.puts "Committing changes..."
-  Dir.chdir(walk_repo_dir) do
-    system("git", "add", "-A")
-    unless system("git", "commit", "-m", "self-modify: #{reason}")
-      $stderr.puts "Warning: git commit failed (perhaps no changes to commit)"
-    end
-  end
-
-  # 3. Write restart marker
-  if walk_dir
-    marker = File.join(walk_dir, "_restart_requested")
-    File.write(marker, "#{Time.now.iso8601}\n#{reason}\n")
-    $stderr.puts "Restart marker written to #{marker}"
-    puts "Self-modification complete. Walk will restart on next iteration."
-  else
-    $stderr.puts "Warning: WALK_DIR not set, no restart marker written."
-    $stderr.puts "Set WALK_DIR or manually create _restart_requested in the walk directory."
-    puts "Self-modification committed but no restart triggered (WALK_DIR not set)."
-  end
-end
-
 SUBCOMMANDS = {
   "new"         => method(:cmd_new),
   "run"         => method(:cmd_run),
@@ -1271,8 +1210,7 @@ SUBCOMMANDS = {
   "epochs"      => method(:cmd_epochs),
   "remember"    => method(:cmd_remember),
   "forget"      => method(:cmd_forget),
-  "memories"    => method(:cmd_memories),
-  "self-modify" => method(:cmd_self_modify)
+  "memories"    => method(:cmd_memories)
 }.freeze
 
 def main
@@ -1309,9 +1247,6 @@ def main
         walk remember <key> --text '...'          Record a memory (artifact, env, constraint)
         walk forget <key>                         Kill a memory (mark as dead)
         walk memories [--all]                     List alive memories (--all includes dead)
-
-      Self-modification (for walk meta-improvement):
-        walk self-modify --reason '...'           Commit walk changes, request restart
 
       All subcommands support --json for structured output.
     HELP
