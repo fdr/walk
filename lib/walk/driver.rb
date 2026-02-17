@@ -172,6 +172,7 @@ module Walk
 
     def run_sequential(once: false, dry_run: false)
       planning_rounds = 0
+      surprising_flag = false
 
       loop do
         check_restart_requested
@@ -188,7 +189,21 @@ module Walk
         issues = @backend.ready_issues(parent: @parent)
         log :info, "Ready issues: #{issues.length}"
 
+        # If a SURPRISING close was detected and there are still ready issues,
+        # force a planning round to re-evaluate before continuing.
+        if surprising_flag && !issues.empty?
+          log :info, "SURPRISING close detected — forcing early planning round before next issue."
+          surprising_flag = false
+          result = spawn_planning_agent(dry_run: dry_run)
+          return if dry_run
+          return if result == :completed
+          sleep @sleep_interval
+          next
+        end
+
         if issues.empty?
+          surprising_flag = false
+
           if parent_closed?
             log :info, "Parent is closed. Exiting."
             finalize_walk("stopped", reason: "parent closed")
@@ -222,6 +237,16 @@ module Walk
 
         work_issue(issue, dry_run: dry_run)
         return if once || dry_run
+
+        # Check if the just-closed issue had a SURPRISING close reason.
+        # If so, flag it so the next iteration forces an early planning round.
+        if @backend.respond_to?(:show_issue)
+          closed_issue = @backend.show_issue(issue_id)
+          if closed_issue && closed_issue[:close_reason].to_s.start_with?("SURPRISING:")
+            log :info, "Issue #{issue_id} closed with SURPRISING reason: #{closed_issue[:close_reason]}"
+            surprising_flag = true
+          end
+        end
 
         sleep @sleep_interval
       end

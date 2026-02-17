@@ -193,12 +193,26 @@ module Walk
         driver_protocol: <<~S.chomp,
           DRIVER PROTOCOL:
           - Work ONLY on this issue. Do NOT expand scope.
+          - ALWAYS use the walk CLI for state mutations. NEVER manipulate the filesystem directly:
+            - To close: `walk close --reason "..."` (NOT: writing close.yaml or moving directories)
+            - To comment: `walk comment "..."` (NOT: appending to comments.md)
+            - To create issues: `walk create <slug> --title "..." --body "..."` (NOT: mkdir + write issue.md)
+            - To read: filesystem reads are fine (cat, ls, grep, walk show, walk list)
+          - The walk CLI handles locking, validation, and state transitions safely.
+            Direct filesystem writes can race with the driver and corrupt state.
           - Document approach and findings as you go using: walk comment "your notes here"
           - Create sub-issues for follow-up work using: walk create <slug> --title "..." --derived-from <current-issue> --body "..."
           - Close ONLY when you have concrete results (code traced, comparison done, experiment ran, fix tested)
           - DO NOT close with "need more investigation" - leave open or create specific sub-issues instead
           - TO CLOSE: walk close --reason "Brief summary of what was accomplished"
             Then EXIT immediately. The driver handles the rest.
+
+          If your findings were unexpected, contradict prior assumptions, or suggest
+          open issues may be based on stale information, signal this:
+            walk close --reason "SURPRISING: <what changed>. <rest of reason>"
+          The driver checks for this prefix and may trigger an early planning round
+          instead of picking up the next issue. This prevents wasted work on issues
+          based on outdated assumptions.
 
           VERIFY YOUR WALK OPERATIONS (use walk CLI, not just filesystem):
           - After `walk create <slug>`: run `walk list` to confirm issue appears
@@ -513,6 +527,9 @@ module Walk
           What the agent should report when done."
           ```
 
+          IMPORTANT: Always use `walk create` to make issues. Do NOT create directories or write issue.md files directly.
+          Use `walk list` to verify issues were created. The CLI handles locking and validation.
+
           Always specify --derived-from to record where this issue came from (epistemic
           provenance — what you learned that led to this issue). Multiple sources are
           allowed: `--derived-from foo --derived-from bar`. This is about provenance
@@ -809,7 +826,7 @@ module Walk
       if @close_protocol == :bd
         "Document findings as you go with bd comments add"
       else
-        "Document findings as you go (write notes to comments.md in the issue directory)"
+        "Document findings as you go using: walk comment \"your notes here\""
       end
     end
   end
